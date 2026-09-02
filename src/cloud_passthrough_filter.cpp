@@ -433,6 +433,7 @@ void CloudPassthroughFilterNode::cloud_callback(
             memory_pool_->release(removed);
         }
         replace_current(current, kept);
+        PT_INFO("体素删点后: %zu → %zu 点", n_in, current->size());
     }
 
     publish_cloud(current, msg->header, publisher_, "最终输出");
@@ -444,44 +445,191 @@ void CloudPassthroughFilterNode::cloud_callback(
     PT_INFO("点云处理完成，耗时 %ld ms", total_ms);
 }
 
-// ---------- 体素删点：在下面把空实现填满 ----------
+// ---------- 体素删点 ----------
 
 void CloudPassthroughFilterNode::buildVoxelSizeTable()
 {
-    // TODO: 按 r_max/2 和 r_max 两档算 size_xy / size_z / thr_z
-    (void)ang_h_;
-    (void)ang_v_;
-    (void)base_xy_;
-    (void)base_z_;
-    (void)max_xy_;
-    (void)max_z_;
-    (void)thr_ratio_;
-    bands_[0].r = r_max_ * 0.5;
-    bands_[1].r = r_max_;
+    // 开机算近、远两套格子尺寸和删点门槛，回调只查表
+    const double r_near = std::max(r_max_ * 0.5, 1e-3);
+    const double r_far = std::max(r_max_, r_near + 1e-3);
+    const double r_list[2] = {r_near, r_far};
+
+    for (size_t i = 0; i < bands_.size(); ++i) {
+        VoxelBand& b = bands_[i];
+        b.r = r_list[i];
+        b.line_gap = b.r * ang_v_;
+        b.pt_gap = b.r * ang_h_;
+
+        // 线间距是基础边长的几倍，向上取整；再夹到上限
+        const double mult_z = std::max(1.0, std::ceil(b.line_gap / std::max(base_z_, 1e-6)));
+        const double mult_xy = std::max(1.0, std::ceil(b.pt_gap / std::max(base_xy_, 1e-6)));
+        b.size_z = std::min(base_z_ * mult_z, max_z_);
+        b.size_xy = std::min(base_xy_ * mult_xy, max_xy_);
+        b.thr_z = b.line_gap * thr_ratio_;
+
+        // 竖直格子至少盖住两条扫描线，否则墙上每格也只有一条线，会全删
+        const double min_size_z = 2.0 * b.line_gap;
+        if (b.size_z < min_size_z) {
+            RCLCPP_WARN(this->get_logger(),
+                        "档%zu size_z=%.4f < 2*line_gap=%.4f，抬到 %.4f",
+                        i, b.size_z, min_size_z, min_size_z);
+            b.size_z = min_size_z;
+        }
+        // 门槛必须小于格子高度，否则跨度永远够不着，等于不删
+        if (b.thr_z >= b.size_z) {
+            const double new_thr = 0.5 * b.size_z;
+            RCLCPP_WARN(this->get_logger(),
+                        "档%zu thr_z=%.4f >= size_z=%.4f，压到 %.4f",
+                        i, b.thr_z, b.size_z, new_thr);
+            b.thr_z = new_thr;
+        }
+
+        b.inv_xy = 1.0 / std::max(b.size_xy, 1e-6);
+        b.inv_z = 1.0 / std::max(b.size_z, 1e-6);
+    }
 }
 
 void CloudPassthroughFilterNode::buildVoxelGrid(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud)
 {
-    // TODO: 第一遍装格
-    (void)cloud;
+    if (!cloud || cloud->empty()) {
+        return;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
+    uint32_t loaded = 0;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        const auto& p = cloud->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+
+        const double r = std::hypot(static_cast<double>(p.x), static_cast<double>(p.y));
+        if (r > r_max_) {
+            continue;
+        }
+
+        const int band = pickBand(r);
+        const VoxelBand& b = bands_[static_cast<size_t>(band)];
+
+        const int ix = static_cast<int>(std::floor(static_cast<double>(p.x) * b.inv_xy));
+        const int iy = static_cast<int>(std::floor(static_cast<double>(p.y) * b.inv_xy));
+        const int iz = static_cast<int>(std::floor(static_cast<double>(p.z) * b.inv_z));
+
+        const int64_t key = makeKey(band, ix, iy, iz);
+        auto it = grid_.find(key);
+        if (it == grid_.end()) {
+            Voxel v;
+            v.count = 1;
+            v.zmin = p.z;
+            v.zmax = p.z;
+            v.idx.push_back(i);
+            v.keep = true;
+            grid_.emplace(key, std::move(v));
+        } else {
+            Voxel& v = it->second;
+            ++v.count;
+            if (p.z < v.zmin) {
+                v.zmin = p.z;
+            }
+            if (p.z > v.zmax) {
+                v.zmax = p.z;
+            }
+            v.idx.push_back(i);
+        }
+        ++loaded;
+    }
+
+    PT_INFO("体素装格: %u 点装入 %zu 格", loaded, grid_.size());
 }
 
 void CloudPassthroughFilterNode::markFlatVoxels()
 {
-    // TODO: 第二遍按 z 跨度打 keep
+    size_t kept = 0;
+    size_t dropped = 0;
+
+    for (auto& entry : grid_) {
+        const int64_t key = entry.first;
+        Voxel& v = entry.second;
+
+        const int band = static_cast<int>((key >> 60) & 0x3);
+        const size_t bi = static_cast<size_t>(std::clamp(band, 0, 1));
+        const float thr = static_cast<float>(bands_[bi].thr_z);
+        const float span = v.zmax - v.zmin;
+
+        v.keep = span >= thr;
+        if (v.keep) {
+            ++kept;
+        } else {
+            ++dropped;
+        }
+    }
+
+    PT_INFO("体素判平: 留 %zu 格, 删 %zu 格", kept, dropped);
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr CloudPassthroughFilterNode::extractByFlag(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
     bool want_keep)
 {
-    // TODO: 第三遍按标记抽点
-    (void)want_keep;
     auto out = memory_pool_->acquire();
-    if (cloud) {
-        *out = *cloud;
+    out->height = 1;
+    out->is_dense = true;
+
+    if (!cloud || cloud->empty()) {
+        out->width = 0;
+        return out;
     }
+
+    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
+    std::vector<char> assigned(n, 0);
+    for (const auto& entry : grid_) {
+        for (uint32_t idx : entry.second.idx) {
+            if (idx < n) {
+                assigned[idx] = 1;
+            }
+        }
+    }
+
+    size_t out_count = 0;
+    for (const auto& entry : grid_) {
+        if (entry.second.keep == want_keep) {
+            out_count += entry.second.idx.size();
+        }
+    }
+    if (want_keep) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!assigned[i]) {
+                ++out_count;
+            }
+        }
+    }
+
+    out->points.reserve(out_count);
+    for (const auto& entry : grid_) {
+        if (entry.second.keep != want_keep) {
+            continue;
+        }
+        for (uint32_t idx : entry.second.idx) {
+            if (idx < n) {
+                out->points.push_back(cloud->points[idx]);
+            }
+        }
+    }
+    if (want_keep) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!assigned[i]) {
+                out->points.push_back(cloud->points[i]);
+            }
+        }
+    }
+
+    out->width = static_cast<uint32_t>(out->points.size());
+    PT_INFO("体素抽点(%s): %zu → %zu",
+            want_keep ? "保留" : "删除",
+            cloud->size(),
+            out->size());
     return out;
 }
 
@@ -495,7 +643,6 @@ int CloudPassthroughFilterNode::pickBand(double r) const
 
 int64_t CloudPassthroughFilterNode::makeKey(int band, int ix, int iy, int iz) const
 {
-    // TODO: 档号 + ix/iy/iz 压成 int64
     constexpr int64_t kOffset = 1 << 19;
     const int64_t ux = static_cast<int64_t>(ix) + kOffset;
     const int64_t uy = static_cast<int64_t>(iy) + kOffset;

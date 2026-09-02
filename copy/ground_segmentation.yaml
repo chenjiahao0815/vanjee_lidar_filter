@@ -1,0 +1,773 @@
+front_ground_segmentation_node:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: "/camera1/depth/points"
+    output_topic: "/camera1/depth/points_non_ground"
+    passthrough_topic_x: "/camera1/depth/points_passthrough_x"
+    passthrough_topic_y: "/camera1/depth/points_passthrough_y"
+    passthrough_topic_z: "/camera1/depth/points_passthrough_z"
+    voxel_topic: "/camera1/depth/points_voxel"
+    first_non_ground_topic: "/camera1/depth/first_non_ground"
+    first_ground_topic: "/camera1/depth/first_ground"
+    ground_topic: "/camera1/depth/ground"
+    transformed_topic: "/camera1/depth/points_transformed"
+    cluster_non_ground_topic: "/camera1/cluster_non_ground"
+    global_frame: "base_footprint"
+    odom_topic: "odom"
+    publish_ground_points: true
+
+    cloud_process_frequency: 3.0
+
+    enable_interprocess_gpu_lock: true
+    gpu_lock_try_skip: false          # 抢不到GPU则丢帧，降低排队延迟
+    enable_gpu_passthrough: false    # false=直通走CPU
+    enable_gpu_voxel: false          # false=体素走CPU；两者都 false 则滤波段不抢 GPU 锁
+    gpu_lock_acquire_mode: "timed_wait"
+    gpu_lock_wait_timeout_ms: 50
+    gpu_lock_file: "/tmp/ground_segmentation_gpu.lock"
+    voxel_max_cells_per_axis: 2048
+
+    ransac_distance_threshold: 0.02    # RANSAC距离阈值
+    ransac_max_iterations: 50          # RANSAC最大迭代次数
+    ransac_probability: 0.99           # RANSAC成功概率
+    ransac_optimize_coefficients: false
+
+    enable_reference_ground_seed: false
+    reference_ground_seed_distance_threshold: -1.0
+    reference_ground_seed_refit_interval: 1.0
+    reference_ground_seed_refit_max_interval: 5.0
+
+    passthrough_dim_x: 0                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_x: 0.0       # 直通滤波下限
+    ground_passthrough_up_limits_x: 3.5        # 直通滤波上限
+
+    enable_ground_passthrough_y: false
+    passthrough_dim_y: 1
+    ground_passthrough_down_limits_y: -2.0
+    ground_passthrough_up_limits_y: 2.0
+
+    passthrough_dim_z: 2                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_z: -0.2       # 直通滤波下限
+    ground_passthrough_up_limits_z: 0.4        # 直通滤波上限
+    non_ground_passthrough_down_limits_z: 0.4       # 直通滤波下限
+    non_ground_passthrough_up_limits_z: 1.5        # 直通滤波上限
+
+    ground_voxelx: 0.02                       # 地面分割体素滤波X方向尺寸
+    ground_voxely: 0.02                       # 地面分割体素滤波Y方向尺寸
+    ground_voxelz: 0.02                       # 地面分割体素滤波Z方向尺寸
+
+    non_ground_voxelx: 0.05                   # 非地面体素(粗)：直接并入障碍，降计算量
+    non_ground_voxely: 0.05
+    non_ground_voxelz: 0.05
+
+    min_points_thrshold: 500
+    ground_distance_threshold: 0.1    # 最终提取非地面点的距离阈值
+    ground_z_threshold: 0.1
+    ground_z_max_offset: 0.05    # 直方图峰值 bin 上沿之上的裕量（m）
+    scale_distance_threshold: 2.0      # X 超过该距离(m)后开始放大 h 阈值
+    ground_h_thresh_distance_slope: 0.5  # 超出后每米阈值系数增量；effective=base*(1+slope*(x-scale_dist))
+    slope_angle_threshold: 20.0
+    max_ground_iterations: 5
+    slope_cut_threshold: 5.0
+
+    # 参考地平面 4D KF（与直方图同内点门限 plane_point_count_threshold）；强门控离群时不融合即冻结
+    ground_ref_plane_kf_process_noise: 1.0e-4
+    ground_ref_plane_kf_q_d_scale: 0.15
+    ground_ref_plane_kf_measurement_noise: 0.06
+    ground_ref_plane_kf_r_d_scale: 2.5
+    ground_ref_plane_reject_n_angle_deg: 10.0
+    ground_ref_plane_reject_d_abs: 0.15
+    ground_ref_plane_max_obs_tilt_deg: 20.0
+    # debug_mode 下在 rviz2 中显示 KF 参考地平面；中心为 base_footprint 原点在平面上的垂足，正方形边长=2*下列半边长
+    reference_ground_plane_marker_topic: "reference_ground_plane_marker"
+    reference_ground_plane_marker_half_extent: 1.0
+    # 平面与竖直夹角(度)大于该值时 extract_ground：非内点全进 non_ground；<= 该值走原对称/非对称带逻辑
+    extract_ground_plane_steep_angle_deg: 30.0
+
+    # 竖直结构预保护（路牙侧面等，Z passthrough 后、平面检测前）
+    # 柱滤波见 docs/vertical_column_filter.md
+    enable_vertical_preserve: true
+    normal_estimation_radius: 0.05
+    vertical_angle_threshold: 70.0
+    vertical_preserved_topic: "/camera1/depth/vertical_preserved_cloud"
+    vertical_preserve_z_min: 0.02           # 立面高度带下限(m)：KF有效时为相对参考地有符号高度，否则世界系Z
+    vertical_preserve_z_max: 0.2           # 立面高度带上限(m)：同上
+    vertical_column_xy_voxels: 3            # 柱底面边长 = N × 对应轴向地面体素
+    vertical_column_min_elevated_points: 2  # 比柱底高 >=1 个 Z 体素的点数门槛
+    vertical_column_filtered_topic: "/camera1/depth/vertical_column_filtered_cloud"
+    vertical_column_marker_topic: "/camera1/depth/vertical_column_markers"
+
+    publish_detected_plane_markers: false
+    publish_slope_plane_markers: false
+    detected_planes_marker_topic: "/camera1/detected_planes_markers"
+    slope_plane_marker_topic: "/camera1/slope_plane_markers"
+    plane_marker_half_extent: 0.8
+    slope_elevated_height_threshold: 0.05   # h_foot 脚下交点高度阈值，超过则直接判非地面
+    enable_slope_footprint_height: false     # 开关：base_footprint 在斜面投影高度(规则2.1+足迹marker)
+    slope_low_z_ratio_threshold: 0.2       # 斜面低高度点占比阈值，>= 为普通坡(地面)
+
+    debug_mode: true
+    cloud_log_interval_sec: 2.0
+
+    enable_area_cluster_filter: true
+    cluster_tolerance: 0.1
+    cluster_ec_min_points: 50
+    cluster_ec_max_points: 100000
+    cluster_min_area: 0.04
+    cluster_min_size_x: 0.1
+    cluster_min_size_y: 0.1
+    cluster_min_size_z: 0.1
+
+    # 高带聚类：h > cluster_skip_height(H_skip) 走独立参数；≤0 关闭分流。见 docs/cluster_skip_height.md
+    cluster_skip_height: 0.5
+    cluster_high_tolerance: 0.15
+    cluster_high_ec_min_points: 5
+    cluster_high_ec_max_points: 100000
+    cluster_high_min_area: 0.01
+    cluster_high_min_size_x: 0.05
+    cluster_high_min_size_y: 0.05
+    cluster_high_min_size_z: 0.05
+
+    continuous_detect_nonground_plane_threshold: 5
+    similar_plane_angle_threshold: 3.0
+    similar_plane_distance_threshold: 0.20  # 共面距离阈值(m)
+    similar_plane_iou_threshold: 0.3        # XY 包围盒 IoU 阈值
+    detected_nonground_plane_list_size: 20      # 历史最大条数封顶
+    detected_nonground_plane_history_duration: 5.0  # 历史时间窗(s)，按点云 stamp 过期
+
+    # 路牙拓扑（docs/curb_topology_classification.md）：VP 簇短轴外扩后贴合 G+P；B2 决策
+    # 贴合成功→非地面；未贴合且角>slope_cut→地面；近水平未贴合→confirm_*
+    enable_curb_topology: true
+    corridor_width: 0.2                    # VP 簇沿短轴双侧外扩总量 (m)
+    vp_cluster_voxel: 0.05                  # VP XY 连通域体素边长 (m)
+    vp_cluster_min_points: 15               # VP 簇最少点数
+    vp_cluster_min_length: 0.5             # VP 簇最小长边 (m)，抑制人/杆短立面
+    vp_attach_min_overlap: 0.5             # 扩框∩G 与 ∩P 沿长轴投影长度下限 (m)
+    curb_topology_marker_topic: "/camera1/curb_topology_markers"
+
+    # map 系地面/非地面 bbox 历史匹配（非地面 IoU 优先 → 地面 → 几何回退；暂地面不入地面表）
+    enable_plane_bbox_history: false
+    plane_hist_map_frame: "map"
+    hist_match_distance_max: 10.0           # 机器人(global原点在map下)到历史框中心距离上限(m)
+    hist_time_window_s: 30.0                 # 历史时间窗(s)
+    hist_ground_list_size: 100               # 地面 bbox 条数上限
+    hist_nonground_list_size: 100            # 非地面 bbox 条数上限
+    hist_iou_ground_threshold: 0.6          # 判地面的 XY-IoU 下限 T_g
+    hist_iou_nonground_threshold: 0.6       # 判非地面的 XY-IoU 下限 T_ng（优先）
+    plane_hist_marker_topic: "/camera1/plane_bbox_history_markers"  # 历史地面(绿)/非地面(红) bbox
+
+    plane_point_count_threshold: 5000
+
+    ground_hist_lower: -0.15
+    ground_hist_upper: 0.15
+    ground_hist_bin_size: 0.02
+    ground_hist_update_interval: 0.2
+    min_ground_hist_count: 50
+
+    reset_ground_hist_count_threshold: 1000
+    odom_linear_velocity_threshold: 0.1
+    odom_angular_velocity_threshold: 0.1
+    stationary_plane_collection_limit: 500
+
+    cluster_center_height_threshold: 0.3
+    cluster_max_points_threshold: 30
+
+    enable_box_filter: false
+    box_regions: "[]"
+
+right_ground_segmentation_node:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: "/camera2/depth/points"
+    output_topic: "/camera2/depth/points_non_ground"
+    passthrough_topic_x: "/camera2/depth/points_passthrough_y"
+    passthrough_topic_y: "/camera2/depth/points_passthrough_y_dim"
+    passthrough_topic_z: "/camera2/depth/points_passthrough_z"
+    voxel_topic: "/camera2/depth/points_voxel"
+    first_non_ground_topic: "/camera2/depth/first_non_ground"
+    first_ground_topic: "/camera2/depth/first_ground"
+    ground_topic: "/camera2/depth/ground"
+    transformed_topic: "/camera2/depth/points_transformed"
+    cluster_non_ground_topic: "/camera2/cluster_non_ground"
+    global_frame: "base_footprint"
+    odom_topic: "odom"
+    publish_ground_points: true
+
+    cloud_process_frequency: 3.0
+
+    enable_interprocess_gpu_lock: true
+    gpu_lock_try_skip: false          # 抢不到GPU则丢帧，降低排队延迟
+    enable_gpu_passthrough: false    # false=直通走CPU
+    enable_gpu_voxel: false          # false=体素走CPU；两者都 false 则滤波段不抢 GPU 锁
+    gpu_lock_acquire_mode: "timed_wait"
+    gpu_lock_wait_timeout_ms: 50
+    gpu_lock_file: "/tmp/ground_segmentation_gpu.lock"
+    voxel_max_cells_per_axis: 2048
+
+    ransac_distance_threshold: 0.02    # RANSAC距离阈值
+    ransac_max_iterations: 50          # RANSAC最大迭代次数
+    ransac_probability: 0.99           # RANSAC成功概率
+    ransac_optimize_coefficients: false
+
+    enable_reference_ground_seed: false
+    reference_ground_seed_distance_threshold: -1.0
+    reference_ground_seed_refit_interval: 1.0
+    reference_ground_seed_refit_max_interval: 5.0
+
+    passthrough_dim_x: 0                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_x: -0.6       # 直通滤波下限
+    ground_passthrough_up_limits_x: 2.0        # 直通滤波上限
+
+    enable_ground_passthrough_y: false
+    passthrough_dim_y: 1
+    ground_passthrough_down_limits_y: -2.0
+    ground_passthrough_up_limits_y: 2.0
+
+    passthrough_dim_z: 2                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_z: -0.2       # 直通滤波下限
+    ground_passthrough_up_limits_z: 0.4        # 直通滤波上限
+    non_ground_passthrough_down_limits_z: 0.4       # 直通滤波下限
+    non_ground_passthrough_up_limits_z: 1.5        # 直通滤波上限
+
+    ground_voxelx: 0.02                       # 地面分割体素滤波X方向尺寸
+    ground_voxely: 0.02                       # 地面分割体素滤波Y方向尺寸
+    ground_voxelz: 0.02                       # 地面分割体素滤波Z方向尺寸
+
+    non_ground_voxelx: 0.05                   # 非地面体素(粗)：直接并入障碍，降计算量
+    non_ground_voxely: 0.05
+    non_ground_voxelz: 0.05
+
+    min_points_thrshold: 500
+    ground_distance_threshold: 0.1    # 最终提取非地面点的距离阈值
+    ground_z_threshold: 0.1
+    ground_z_max_offset: 0.05    # 直方图峰值 bin 上沿之上的裕量（m）
+    scale_distance_threshold: 2.0      # X 超过该距离(m)后开始放大 h 阈值
+    ground_h_thresh_distance_slope: 0.5  # 超出后每米阈值系数增量；effective=base*(1+slope*(x-scale_dist))
+    slope_angle_threshold: 20.0
+    max_ground_iterations: 5
+    slope_cut_threshold: 5.0
+
+    # 参考地平面 4D KF（与直方图同内点门限 plane_point_count_threshold）；强门控离群时不融合即冻结
+    ground_ref_plane_kf_process_noise: 1.0e-4
+    ground_ref_plane_kf_q_d_scale: 0.15
+    ground_ref_plane_kf_measurement_noise: 0.06
+    ground_ref_plane_kf_r_d_scale: 2.5
+    ground_ref_plane_reject_n_angle_deg: 10.0
+    ground_ref_plane_reject_d_abs: 0.15
+    ground_ref_plane_max_obs_tilt_deg: 20.0
+    # debug_mode 下在 rviz2 中显示 KF 参考地平面；中心为 base_footprint 原点在平面上的垂足，正方形边长=2*下列半边长
+    reference_ground_plane_marker_topic: "reference_ground_plane_marker"
+    reference_ground_plane_marker_half_extent: 1.0
+    # 平面与竖直夹角(度)大于该值时 extract_ground：非内点全进 non_ground；<= 该值走原对称/非对称带逻辑
+    extract_ground_plane_steep_angle_deg: 30.0
+
+    # 竖直结构预保护（路牙侧面等，Z passthrough 后、平面检测前）
+    # 柱滤波见 docs/vertical_column_filter.md
+    enable_vertical_preserve: true
+    normal_estimation_radius: 0.05
+    vertical_angle_threshold: 70.0
+    vertical_preserved_topic: "/camera2/depth/vertical_preserved_cloud"
+    vertical_preserve_z_min: 0.02           # 立面高度带下限(m)：KF有效时为相对参考地有符号高度，否则世界系Z
+    vertical_preserve_z_max: 0.2           # 立面高度带上限(m)：同上
+    vertical_column_xy_voxels: 2            # 柱底面边长 = N × 对应轴向地面体素
+    vertical_column_min_elevated_points: 2  # 比柱底高 >=1 个 Z 体素的点数门槛
+    vertical_column_filtered_topic: "/camera2/depth/vertical_column_filtered_cloud"
+    vertical_column_marker_topic: "/camera2/depth/vertical_column_markers"
+
+    publish_detected_plane_markers: false
+    publish_slope_plane_markers: false
+    detected_planes_marker_topic: "/camera2/detected_planes_markers"
+    slope_plane_marker_topic: "/camera2/slope_plane_markers"
+    plane_marker_half_extent: 0.8
+    slope_elevated_height_threshold: 0.05   # h_foot 脚下交点高度阈值，超过则直接判非地面
+    enable_slope_footprint_height: false     # 开关：base_footprint 在斜面投影高度(规则2.1+足迹marker)
+    slope_low_z_ratio_threshold: 0.2       # 斜面低高度点占比阈值，>= 为普通坡(地面)
+
+    debug_mode: true
+    cloud_log_interval_sec: 2.0
+
+    enable_area_cluster_filter: true
+    cluster_tolerance: 0.1
+    cluster_ec_min_points: 50
+    cluster_ec_max_points: 100000
+    cluster_min_area: 0.04
+    cluster_min_size_x: 0.1
+    cluster_min_size_y: 0.1
+    cluster_min_size_z: 0.1
+
+    # 高带聚类：h > cluster_skip_height(H_skip) 走独立参数；≤0 关闭分流。见 docs/cluster_skip_height.md
+    cluster_skip_height: 0.5
+    cluster_high_tolerance: 0.075
+    cluster_high_ec_min_points: 20
+    cluster_high_ec_max_points: 100000
+    cluster_high_min_area: 0.01
+    cluster_high_min_size_x: 0.05
+    cluster_high_min_size_y: 0.05
+    cluster_high_min_size_z: 0.05
+
+    continuous_detect_nonground_plane_threshold: 5
+    similar_plane_angle_threshold: 3.0
+    similar_plane_distance_threshold: 0.20  # 共面距离阈值(m)
+    similar_plane_iou_threshold: 0.3        # XY 包围盒 IoU 阈值
+    detected_nonground_plane_list_size: 20      # 历史最大条数封顶
+    detected_nonground_plane_history_duration: 5.0  # 历史时间窗(s)，按点云 stamp 过期
+
+    # 路牙拓扑（docs/curb_topology_classification.md）：VP 簇短轴外扩后贴合 G+P；B2 决策
+    # 贴合成功→非地面；未贴合且角>slope_cut→地面；近水平未贴合→confirm_*
+    enable_curb_topology: true
+    corridor_width: 0.2                    # VP 簇沿短轴双侧外扩总量 (m)
+    vp_cluster_voxel: 0.05                  # VP XY 连通域体素边长 (m)
+    vp_cluster_min_points: 15               # VP 簇最少点数
+    vp_cluster_min_length: 0.5             # VP 簇最小长边 (m)，抑制人/杆短立面
+    vp_attach_min_overlap: 0.5             # 扩框∩G 与 ∩P 沿长轴投影长度下限 (m)
+    curb_topology_marker_topic: "/camera2/curb_topology_markers"
+
+    # map 系地面/非地面 bbox 历史匹配（非地面 IoU 优先 → 地面 → 几何回退；暂地面不入地面表）
+    enable_plane_bbox_history: false
+    plane_hist_map_frame: "map"
+    hist_match_distance_max: 10.0           # 机器人(global原点在map下)到历史框中心距离上限(m)
+    hist_time_window_s: 30.0                 # 历史时间窗(s)
+    hist_ground_list_size: 100               # 地面 bbox 条数上限
+    hist_nonground_list_size: 100            # 非地面 bbox 条数上限
+    hist_iou_ground_threshold: 0.6          # 判地面的 XY-IoU 下限 T_g
+    hist_iou_nonground_threshold: 0.6       # 判非地面的 XY-IoU 下限 T_ng（优先）
+    plane_hist_marker_topic: "/camera2/plane_bbox_history_markers"  # 历史地面(绿)/非地面(红) bbox
+
+    plane_point_count_threshold: 1000
+
+    ground_hist_lower: -0.15
+    ground_hist_upper: 0.15
+    ground_hist_bin_size: 0.02
+    ground_hist_update_interval: 0.2
+    min_ground_hist_count: 50
+
+    reset_ground_hist_count_threshold: 1000
+    odom_linear_velocity_threshold: 0.1
+    odom_angular_velocity_threshold: 0.1
+    stationary_plane_collection_limit: 500
+
+    cluster_center_height_threshold: 0.3
+    cluster_max_points_threshold: 30
+
+    enable_box_filter: true  # 是否启用长方体区域过滤
+    box_regions: "[[0.85, -0.625, 0.25, 0.6, 0.6, 0.6], [0.2, -0.6, 0.55, 0.3, 0.3, 0.3], [-0.1, -0.6, 0.3, 0.3, 0.3, 0.4]]"
+
+back_ground_segmentation_node:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: "/camera3/depth/points"
+    output_topic: "/camera3/depth/points_non_ground"
+    passthrough_topic_x: "/camera3/depth/points_passthrough_x"
+    passthrough_topic_y: "/camera3/depth/points_passthrough_y"
+    passthrough_topic_z: "/camera3/depth/points_passthrough_z"
+    voxel_topic: "/camera3/depth/points_voxel"
+    first_non_ground_topic: "/camera3/depth/first_non_ground"
+    first_ground_topic: "/camera3/depth/first_ground"
+    ground_topic: "/camera3/depth/ground"
+    transformed_topic: "/camera3/depth/points_transformed"
+    cluster_non_ground_topic: "/camera3/cluster_non_ground"
+    global_frame: "base_footprint"
+    odom_topic: "odom"
+    publish_ground_points: true
+
+    cloud_process_frequency: 3.0
+
+    enable_interprocess_gpu_lock: true
+    gpu_lock_try_skip: false          # 抢不到GPU则丢帧，降低排队延迟
+    enable_gpu_passthrough: true    # false=直通走CPU
+    enable_gpu_voxel: true          # false=体素走CPU；两者都 false 则滤波段不抢 GPU 锁
+    gpu_lock_acquire_mode: "timed_wait"
+    gpu_lock_wait_timeout_ms: 50
+    gpu_lock_file: "/tmp/ground_segmentation_gpu.lock"
+    voxel_max_cells_per_axis: 2048
+
+    ransac_distance_threshold: 0.02    # RANSAC距离阈值
+    ransac_max_iterations: 50          # RANSAC最大迭代次数
+    ransac_probability: 0.99           # RANSAC成功概率
+    ransac_optimize_coefficients: false
+
+    enable_reference_ground_seed: false
+    reference_ground_seed_distance_threshold: -1.0
+    reference_ground_seed_refit_interval: 1.0
+    reference_ground_seed_refit_max_interval: 5.0
+
+    passthrough_dim_x: 0                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_x: -2.5       # 直通滤波下限
+    ground_passthrough_up_limits_x: 0.0        # 直通滤波上限
+
+    enable_ground_passthrough_y: false
+    passthrough_dim_y: 1
+    ground_passthrough_down_limits_y: -2.0
+    ground_passthrough_up_limits_y: 2.0
+
+    passthrough_dim_z: 2                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_z: -0.1       # 直通滤波下限
+    ground_passthrough_up_limits_z: 0.4        # 直通滤波上限
+    non_ground_passthrough_down_limits_z: 0.4       # 直通滤波下限
+    non_ground_passthrough_up_limits_z: 1.5        # 直通滤波上限
+
+    ground_voxelx: 0.02                       # 地面分割体素滤波X方向尺寸
+    ground_voxely: 0.02                       # 地面分割体素滤波Y方向尺寸
+    ground_voxelz: 0.02                       # 地面分割体素滤波Z方向尺寸
+
+    non_ground_voxelx: 0.05                   # 非地面体素(粗)：直接并入障碍，降计算量
+    non_ground_voxely: 0.05
+    non_ground_voxelz: 0.05
+
+    min_points_thrshold: 500
+    ground_distance_threshold: 0.1    # 最终提取非地面点的距离阈值
+    ground_z_threshold: 0.1
+    ground_z_max_offset: 0.05    # 直方图峰值 bin 上沿之上的裕量（m）
+    scale_distance_threshold: 2.0      # X 超过该距离(m)后开始放大 h 阈值
+    ground_h_thresh_distance_slope: 0.5  # 超出后每米阈值系数增量；effective=base*(1+slope*(x-scale_dist))
+    slope_angle_threshold: 20.0
+    max_ground_iterations: 5
+    slope_cut_threshold: 5.0
+
+    # 参考地平面 4D KF（与直方图同内点门限 plane_point_count_threshold）；强门控离群时不融合即冻结
+    ground_ref_plane_kf_process_noise: 1.0e-4
+    ground_ref_plane_kf_q_d_scale: 0.15
+    ground_ref_plane_kf_measurement_noise: 0.06
+    ground_ref_plane_kf_r_d_scale: 2.5
+    ground_ref_plane_reject_n_angle_deg: 10.0
+    ground_ref_plane_reject_d_abs: 0.15
+    ground_ref_plane_max_obs_tilt_deg: 20.0
+    # debug_mode 下在 rviz2 中显示 KF 参考地平面；中心为 base_footprint 原点在平面上的垂足，正方形边长=2*下列半边长
+    reference_ground_plane_marker_topic: "reference_ground_plane_marker"
+    reference_ground_plane_marker_half_extent: 1.0
+    # 平面与竖直夹角(度)大于该值时 extract_ground：非内点全进 non_ground；<= 该值走原对称/非对称带逻辑
+    extract_ground_plane_steep_angle_deg: 30.0
+
+    # 竖直结构预保护（路牙侧面等，Z passthrough 后、平面检测前）
+    # 柱滤波见 docs/vertical_column_filter.md
+    enable_vertical_preserve: true
+    normal_estimation_radius: 0.05
+    vertical_angle_threshold: 70.0
+    vertical_preserved_topic: "/camera3/depth/vertical_preserved_cloud"
+    vertical_preserve_z_min: 0.05           # 立面高度带下限(m)：KF有效时为相对参考地有符号高度，否则世界系Z
+    vertical_preserve_z_max: 0.2           # 立面高度带上限(m)：同上
+    vertical_column_xy_voxels: 3            # 柱底面边长 = N × 对应轴向地面体素
+    vertical_column_min_elevated_points: 3  # 比柱底高 >=1 个 Z 体素的点数门槛
+    vertical_column_filtered_topic: "/camera3/depth/vertical_column_filtered_cloud"
+    vertical_column_marker_topic: "/camera3/depth/vertical_column_markers"
+
+    publish_detected_plane_markers: false
+    publish_slope_plane_markers: false
+    detected_planes_marker_topic: "/camera3/detected_planes_markers"
+    slope_plane_marker_topic: "/camera3/slope_plane_markers"
+    plane_marker_half_extent: 0.8
+    slope_elevated_height_threshold: 0.05   # h_foot 脚下交点高度阈值，超过则直接判非地面
+    enable_slope_footprint_height: false     # 开关：base_footprint 在斜面投影高度(规则2.1+足迹marker)
+    slope_low_z_ratio_threshold: 0.2       # 斜面低高度点占比阈值，>= 为普通坡(地面)
+
+    debug_mode: true
+    cloud_log_interval_sec: 2.0
+
+    enable_area_cluster_filter: true
+    cluster_tolerance: 0.1
+    cluster_ec_min_points: 50
+    cluster_ec_max_points: 100000
+    cluster_min_area: 0.04
+    cluster_min_size_x: 0.1
+    cluster_min_size_y: 0.1
+    cluster_min_size_z: 0.1
+
+    # 高带聚类：h > cluster_skip_height(H_skip) 走独立参数；≤0 关闭分流。见 docs/cluster_skip_height.md
+    cluster_skip_height: 0.5
+    cluster_high_tolerance: 0.15
+    cluster_high_ec_min_points: 5
+    cluster_high_ec_max_points: 100000
+    cluster_high_min_area: 0.01
+    cluster_high_min_size_x: 0.05
+    cluster_high_min_size_y: 0.05
+    cluster_high_min_size_z: 0.05
+
+    continuous_detect_nonground_plane_threshold: 5
+    similar_plane_angle_threshold: 3.0
+    similar_plane_distance_threshold: 0.20  # 共面距离阈值(m)
+    similar_plane_iou_threshold: 0.3        # XY 包围盒 IoU 阈值
+    detected_nonground_plane_list_size: 20      # 历史最大条数封顶
+    detected_nonground_plane_history_duration: 5.0  # 历史时间窗(s)，按点云 stamp 过期
+
+    # 路牙拓扑（docs/curb_topology_classification.md）：VP 簇短轴外扩后贴合 G+P；B2 决策
+    # 贴合成功→非地面；未贴合且角>slope_cut→地面；近水平未贴合→confirm_*
+    enable_curb_topology: true
+    corridor_width: 0.2                    # VP 簇沿短轴双侧外扩总量 (m)
+    vp_cluster_voxel: 0.05                  # VP XY 连通域体素边长 (m)
+    vp_cluster_min_points: 15               # VP 簇最少点数
+    vp_cluster_min_length: 0.5             # VP 簇最小长边 (m)，抑制人/杆短立面
+    vp_attach_min_overlap: 0.5             # 扩框∩G 与 ∩P 沿长轴投影长度下限 (m)
+    curb_topology_marker_topic: "/camera3/curb_topology_markers"
+
+    # map 系地面/非地面 bbox 历史匹配（非地面 IoU 优先 → 地面 → 几何回退；暂地面不入地面表）
+    enable_plane_bbox_history: false
+    plane_hist_map_frame: "map"
+    hist_match_distance_max: 10.0           # 机器人(global原点在map下)到历史框中心距离上限(m)
+    hist_time_window_s: 30.0                 # 历史时间窗(s)
+    hist_ground_list_size: 100               # 地面 bbox 条数上限
+    hist_nonground_list_size: 100            # 非地面 bbox 条数上限
+    hist_iou_ground_threshold: 0.6          # 判地面的 XY-IoU 下限 T_g
+    hist_iou_nonground_threshold: 0.6       # 判非地面的 XY-IoU 下限 T_ng（优先）
+    plane_hist_marker_topic: "/camera3/plane_bbox_history_markers"  # 历史地面(绿)/非地面(红) bbox
+
+    plane_point_count_threshold: 5000
+
+    ground_hist_lower: -0.15
+    ground_hist_upper: 0.15
+    ground_hist_bin_size: 0.02
+    ground_hist_update_interval: 0.2
+    min_ground_hist_count: 50
+
+    reset_ground_hist_count_threshold: 1000
+    odom_linear_velocity_threshold: 0.1
+    odom_angular_velocity_threshold: 0.1
+    stationary_plane_collection_limit: 500
+
+    cluster_center_height_threshold: 0.3
+    cluster_max_points_threshold: 30
+
+    enable_box_filter: false
+    box_regions: "[]"
+
+left_ground_segmentation_node:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: "/camera4/depth/points"
+    output_topic: "/camera4/depth/points_non_ground"
+    passthrough_topic_x: "/camera4/depth/points_passthrough_y"
+    passthrough_topic_y: "/camera4/depth/points_passthrough_y_dim"
+    passthrough_topic_z: "/camera4/depth/points_passthrough_z"
+    voxel_topic: "/camera4/depth/points_voxel"
+    first_non_ground_topic: "/camera4/depth/first_non_ground"
+    first_ground_topic: "/camera4/depth/first_ground"
+    ground_topic: "/camera4/depth/ground"
+    transformed_topic: "/camera4/depth/points_transformed"
+    cluster_non_ground_topic: "/camera4/cluster_non_ground"
+    global_frame: "base_footprint"
+    odom_topic: "odom"
+    publish_ground_points: true
+
+    cloud_process_frequency: 3.0
+
+    enable_interprocess_gpu_lock: true
+    gpu_lock_try_skip: false          # 抢不到GPU则丢帧，降低排队延迟
+    enable_gpu_passthrough: true    # false=直通走CPU
+    enable_gpu_voxel: true          # false=体素走CPU；两者都 false 则滤波段不抢 GPU 锁
+    gpu_lock_acquire_mode: "timed_wait"
+    gpu_lock_wait_timeout_ms: 50
+    gpu_lock_file: "/tmp/ground_segmentation_gpu.lock"
+    voxel_max_cells_per_axis: 2048
+
+    ransac_distance_threshold: 0.02    # RANSAC距离阈值
+    ransac_max_iterations: 50          # RANSAC最大迭代次数
+    ransac_probability: 0.99           # RANSAC成功概率
+    ransac_optimize_coefficients: false
+
+    enable_reference_ground_seed: false
+    reference_ground_seed_distance_threshold: -1.0
+    reference_ground_seed_refit_interval: 1.0
+    reference_ground_seed_refit_max_interval: 5.0
+
+    passthrough_dim_x: 0                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_x: -0.6       # 直通滤波下限
+    ground_passthrough_up_limits_x: 2.0        # 直通滤波上限
+
+    enable_ground_passthrough_y: false
+    passthrough_dim_y: 1
+    ground_passthrough_down_limits_y: -2.0
+    ground_passthrough_up_limits_y: 2.0
+
+    passthrough_dim_z: 2                 # 直通滤波维度 (0:X, 1:Y, 2:Z)
+    ground_passthrough_down_limits_z: -0.1       # 直通滤波下限
+    ground_passthrough_up_limits_z: 0.4        # 直通滤波上限
+    non_ground_passthrough_down_limits_z: 0.4       # 直通滤波下限
+    non_ground_passthrough_up_limits_z: 1.5        # 直通滤波上限
+
+    ground_voxelx: 0.02                       # 地面分割体素滤波X方向尺寸
+    ground_voxely: 0.02                       # 地面分割体素滤波Y方向尺寸
+    ground_voxelz: 0.02                       # 地面分割体素滤波Z方向尺寸
+
+    non_ground_voxelx: 0.05                   # 非地面体素(粗)：直接并入障碍，降计算量
+    non_ground_voxely: 0.05
+    non_ground_voxelz: 0.05
+
+    min_points_thrshold: 500
+    ground_distance_threshold: 0.1    # 最终提取非地面点的距离阈值
+    ground_z_threshold: 0.1
+    ground_z_max_offset: 0.05    # 直方图峰值 bin 上沿之上的裕量（m）
+    scale_distance_threshold: 2.0      # X 超过该距离(m)后开始放大 h 阈值
+    ground_h_thresh_distance_slope: 0.5  # 超出后每米阈值系数增量；effective=base*(1+slope*(x-scale_dist))
+    slope_angle_threshold: 20.0
+    max_ground_iterations: 5
+    slope_cut_threshold: 5.0
+
+    # 参考地平面 4D KF（与直方图同内点门限 plane_point_count_threshold）；强门控离群时不融合即冻结
+    ground_ref_plane_kf_process_noise: 1.0e-4
+    ground_ref_plane_kf_q_d_scale: 0.15
+    ground_ref_plane_kf_measurement_noise: 0.06
+    ground_ref_plane_kf_r_d_scale: 2.5
+    ground_ref_plane_reject_n_angle_deg: 10.0
+    ground_ref_plane_reject_d_abs: 0.15
+    ground_ref_plane_max_obs_tilt_deg: 20.0
+    # debug_mode 下在 rviz2 中显示 KF 参考地平面；中心为 base_footprint 原点在平面上的垂足，正方形边长=2*下列半边长
+    reference_ground_plane_marker_topic: "reference_ground_plane_marker"
+    reference_ground_plane_marker_half_extent: 1.0
+    # 平面与竖直夹角(度)大于该值时 extract_ground：非内点全进 non_ground；<= 该值走原对称/非对称带逻辑
+    extract_ground_plane_steep_angle_deg: 30.0
+
+    # 竖直结构预保护（路牙侧面等，Z passthrough 后、平面检测前）
+    # 柱滤波见 docs/vertical_column_filter.md
+    enable_vertical_preserve: true
+    normal_estimation_radius: 0.05
+    vertical_angle_threshold: 70.0
+    vertical_preserved_topic: "/camera4/depth/vertical_preserved_cloud"
+    vertical_preserve_z_min: 0.05           # 立面高度带下限(m)：KF有效时为相对参考地有符号高度，否则世界系Z
+    vertical_preserve_z_max: 0.2           # 立面高度带上限(m)：同上
+    vertical_column_xy_voxels: 3            # 柱底面边长 = N × 对应轴向地面体素
+    vertical_column_min_elevated_points: 3  # 比柱底高 >=1 个 Z 体素的点数门槛
+    vertical_column_filtered_topic: "/camera4/depth/vertical_column_filtered_cloud"
+    vertical_column_marker_topic: "/camera4/depth/vertical_column_markers"
+
+    publish_detected_plane_markers: false
+    publish_slope_plane_markers: false
+    detected_planes_marker_topic: "/camera4/detected_planes_markers"
+    slope_plane_marker_topic: "/camera4/slope_plane_markers"
+    plane_marker_half_extent: 0.8
+    slope_elevated_height_threshold: 0.05   # h_foot 脚下交点高度阈值，超过则直接判非地面
+    enable_slope_footprint_height: false     # 开关：base_footprint 在斜面投影高度(规则2.1+足迹marker)
+    slope_low_z_ratio_threshold: 0.2       # 斜面低高度点占比阈值，>= 为普通坡(地面)
+
+    debug_mode: true
+    cloud_log_interval_sec: 2.0
+
+    enable_area_cluster_filter: true
+    cluster_tolerance: 0.1
+    cluster_ec_min_points: 50
+    cluster_ec_max_points: 100000
+    cluster_min_area: 0.04
+    cluster_min_size_x: 0.1
+    cluster_min_size_y: 0.1
+    cluster_min_size_z: 0.1
+
+    # 高带聚类：h > cluster_skip_height(H_skip) 走独立参数；≤0 关闭分流。见 docs/cluster_skip_height.md
+    cluster_skip_height: 0.5
+    cluster_high_tolerance: 0.075
+    cluster_high_ec_min_points: 20
+    cluster_high_ec_max_points: 100000
+    cluster_high_min_area: 0.01
+    cluster_high_min_size_x: 0.05
+    cluster_high_min_size_y: 0.05
+    cluster_high_min_size_z: 0.05
+
+    continuous_detect_nonground_plane_threshold: 5
+    similar_plane_angle_threshold: 2.0
+    similar_plane_distance_threshold: 0.20  # 共面距离阈值(m)
+    similar_plane_iou_threshold: 0.3        # XY 包围盒 IoU 阈值
+    detected_nonground_plane_list_size: 20      # 历史最大条数封顶
+    detected_nonground_plane_history_duration: 5.0  # 历史时间窗(s)，按点云 stamp 过期
+
+    # 路牙拓扑（docs/curb_topology_classification.md）：VP 簇短轴外扩后贴合 G+P；B2 决策
+    # 贴合成功→非地面；未贴合且角>slope_cut→地面；近水平未贴合→confirm_*
+    enable_curb_topology: true
+    corridor_width: 0.2                    # VP 簇沿短轴双侧外扩总量 (m)
+    vp_cluster_voxel: 0.05                  # VP XY 连通域体素边长 (m)
+    vp_cluster_min_points: 15               # VP 簇最少点数
+    vp_cluster_min_length: 0.5             # VP 簇最小长边 (m)，抑制人/杆短立面
+    vp_attach_min_overlap: 0.5             # 扩框∩G 与 ∩P 沿长轴投影长度下限 (m)
+    curb_topology_marker_topic: "/camera4/curb_topology_markers"
+
+    # map 系地面/非地面 bbox 历史匹配（非地面 IoU 优先 → 地面 → 几何回退；暂地面不入地面表）
+    enable_plane_bbox_history: false
+    plane_hist_map_frame: "map"
+    hist_match_distance_max: 10.0           # 机器人(global原点在map下)到历史框中心距离上限(m)
+    hist_time_window_s: 30.0                 # 历史时间窗(s)
+    hist_ground_list_size: 100               # 地面 bbox 条数上限
+    hist_nonground_list_size: 100            # 非地面 bbox 条数上限
+    hist_iou_ground_threshold: 0.6          # 判地面的 XY-IoU 下限 T_g
+    hist_iou_nonground_threshold: 0.6       # 判非地面的 XY-IoU 下限 T_ng（优先）
+    plane_hist_marker_topic: "/camera4/plane_bbox_history_markers"  # 历史地面(绿)/非地面(红) bbox
+
+    plane_point_count_threshold: 1000
+
+    ground_hist_lower: -0.15
+    ground_hist_upper: 0.15
+    ground_hist_bin_size: 0.02
+    ground_hist_update_interval: 0.2
+    min_ground_hist_count: 50
+
+    reset_ground_hist_count_threshold: 1000
+    odom_linear_velocity_threshold: 0.1
+    odom_angular_velocity_threshold: 0.1
+    stationary_plane_collection_limit: 500
+
+    cluster_center_height_threshold: 0.3
+    cluster_max_points_threshold: 30
+
+    enable_box_filter: true  # 是否启用长方体区域过滤
+    box_regions: "[[0.85, 0.625, 0.25, 0.6, 0.6, 0.6], [0.2, 0.6, 0.55, 0.3, 0.3, 0.3], [-0.1, 0.6, 0.3, 0.3, 0.3, 0.4]]"
+
+curb_extraction_node:
+  ros__parameters:
+    use_sim_time: false
+    debug_mode: true
+
+    # 話題參數
+    input_topic: "/camera1/depth/points"
+    line_topic: "/camera1/extracted_line"
+    path_topic: "/camera1/extracted_line_path"
+    voxel_debug_topic: "/camera1/voxel_debug_cloud"
+    x_passthrough_debug_topic: "/camera1/x_passthrough_debug_cloud"
+    z_passthrough_topic: "/camera1/z_passthrough_cloud"
+    vertical_points_topic: "/camera1/vertical_points_cloud"
+    max_vertical_points_topic: "/camera1/max_vertical_points_cloud"
+    line_points_topic: "/camera1/line_points_cloud"
+    plane_points_topic: "/camera1/plane_points_cloud"
+
+    global_frame: "base_footprint"
+
+    # 滤波参数
+    voxel_size_x: 0.05
+    voxel_size_y: 0.02
+    voxel_size_z: 0.05
+
+    z_filter_min: 0.0
+    z_filter_max: 0.2
+
+    x_filter_min: 0.0
+    x_filter_max: 5.0
+
+    # 法向量估计参数
+    normal_estimation_radius: 0.05
+    vertical_angle_threshold: 70.0
+
+    # 区域生长参数
+    min_cluster_size: 50
+    max_cluster_size: 100000
+    curvature_threshold: 1.0
+    residual_threshold: 0.05
+
+    # RANSAC擬合直線方程參數
+    ransac_distance_threshold: 0.01
+    max_line_iterations: 50
+    min_line_length: 0.5
+    ransac_line_angle_threshold: 5.0
+
+    # 歐式聚類點雲參數
+    euclidean_cluster_tolerance: 0.1
+
+    # 發佈Path話題參數
+    path_sampling_interval: 1.0
+
+    # 從垂直地面點雲中提取直線簇參數
+    angle_threshold: 10.0
+    search_radius: 0.2
+    min_segment_size: 10
+
+    # 卡尔曼滤波参数
+    kalman_process_noise: 0.01
+    kalman_measurement_noise: 0.1
+    kalman_warmup_frames: 10
+    kalman_no_line_timeout: 1.0
+    kalman_line_distance_threshold: 0.5
+    kalman_line_angle_threshold: 10.0
+    enable_kalman_filter: true
