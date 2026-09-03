@@ -41,9 +41,10 @@ struct AxisSpec {
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_pub;
 };
 
-// 距离档：近档 / 远档，边长和门槛构造时算死
-struct VoxelBand {
-    double r{0.0};
+// 按当前距离和角分辨率算出来的一格尺寸与删点门槛
+struct VoxelScale {
+    int mult_xy{1};
+    int mult_z{1};
     double line_gap{0.0};
     double pt_gap{0.0};
     double size_xy{0.0};
@@ -54,9 +55,14 @@ struct VoxelBand {
 };
 
 struct Voxel {
+    int ix{0};
+    int iy{0};
+    int iz{0};
     uint32_t count{0};
     float zmin{0.0f};
     float zmax{0.0f};
+    float thr_z{0.0f};
+    float r{0.0f};
     std::vector<uint32_t> idx;
     bool keep{true};
 };
@@ -93,15 +99,19 @@ private:
 
     void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
 
-    // 体素删点，接在直通滤波之后写
-    void buildVoxelSizeTable();
+    void logVoxelScaleSamples() const;
+    VoxelScale computeVoxelScale(double r) const;
+    bool inOurCube(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
-    void markFlatVoxels();
-    pcl::PointCloud<pcl::PointXYZ>::Ptr extractByFlag(
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-        bool want_keep);
-    int pickBand(double r) const;
-    int64_t makeKey(int band, int ix, int iy, int iz) const;
+    void mergeFineVoxels();
+    // 接收有点的体素列表，返回需要删除的体素；真正删点另写
+    std::vector<Voxel*> collectBadVoxels();
+    void removePointsInBadVoxels(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<Voxel*>& bad_voxels,
+        const std_msgs::msg::Header& header);
+    int64_t makeKey(int ix, int iy, int iz) const;
+    int floorDiv(int a, int b) const;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
@@ -120,13 +130,18 @@ private:
 
     int memory_pool_size_{10};
     int memory_pool_reserve_{1000000};
-    bool debug_mode_{false};
+    bool debug_mode_{true};
     double cloud_log_interval_sec_{1.0};
 
     bool frame_log_enabled_{false};
     std::chrono::steady_clock::time_point last_cloud_log_time_{};
 
-    // 体素参数
+    // 我们自己的立方体，和直通滤波无关；以雷达原点为中心，长宽高是参数
+    double cube_length_{4.0};
+    double cube_width_{4.0};
+    double cube_height_{2.0};
+
+    // 体素参数：边长 = 默认值 × 整数倍率；倍率由距离×角分辨率相对默认值向上取整
     double ang_h_{0.0};
     double ang_v_{0.0};
     double r_max_{8.0};
@@ -135,10 +150,10 @@ private:
     double max_xy_{0.5};
     double max_z_{0.5};
     double thr_ratio_{0.5};
-    bool enable_voxel_filter_{false};
+    bool enable_voxel_filter_{true};
 
-    std::array<VoxelBand, 2> bands_{};
     std::unordered_map<int64_t, Voxel> grid_;
+    std::unordered_map<int64_t, Voxel> fine_grid_;
 };
 
 #endif  // VANJEE_LIDAR_FILTER__CLOUD_PASSTHROUGH_FILTER_HPP_

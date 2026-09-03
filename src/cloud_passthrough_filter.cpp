@@ -87,8 +87,8 @@ CloudPassthroughFilterNode::CloudPassthroughFilterNode()
         }
     }
 
-    buildVoxelSizeTable();
     grid_.reserve(4096);
+    fine_grid_.reserve(4096);
     log_startup();
 }
 
@@ -107,7 +107,7 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("limit_max_y", 2.0);
     this->declare_parameter("limit_min_z", -0.2);
     this->declare_parameter("limit_max_z", 0.4);
-    this->declare_parameter("debug_mode", false);
+    this->declare_parameter("debug_mode", true);
     this->declare_parameter("debug_topic_x", std::string("passthrough_cloud_x"));
     this->declare_parameter("debug_topic_y", std::string("passthrough_cloud_y"));
     this->declare_parameter("debug_topic_z", std::string("passthrough_cloud_z"));
@@ -115,7 +115,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("memory_pool_reserve", 1000000);
     this->declare_parameter("cloud_log_interval_sec", 1.0);
 
-    this->declare_parameter("enable_voxel_filter", false);
+    this->declare_parameter("enable_voxel_filter", true);
+    this->declare_parameter("cube_length", 4.0);
+    this->declare_parameter("cube_width", 4.0);
+    this->declare_parameter("cube_height", 2.0);
     this->declare_parameter("ang_h", 0.0034906585);   // 约 0.2 deg
     this->declare_parameter("ang_v", 0.0174532925);   // 约 1.0 deg
     this->declare_parameter("r_max", 8.0);
@@ -147,6 +150,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     cloud_log_interval_sec_ = this->get_parameter("cloud_log_interval_sec").as_double();
 
     enable_voxel_filter_ = this->get_parameter("enable_voxel_filter").as_bool();
+    cube_length_ = this->get_parameter("cube_length").as_double();
+    cube_width_ = this->get_parameter("cube_width").as_double();
+    cube_height_ = this->get_parameter("cube_height").as_double();
     ang_h_ = this->get_parameter("ang_h").as_double();
     ang_v_ = this->get_parameter("ang_v").as_double();
     r_max_ = this->get_parameter("r_max").as_double();
@@ -260,12 +266,13 @@ void CloudPassthroughFilterNode::log_startup() const
                 cloud_log_interval_sec_);
     RCLCPP_INFO(this->get_logger(), "  体素删点: %s", enable_voxel_filter_ ? "开" : "关");
     if (enable_voxel_filter_) {
-        for (size_t i = 0; i < bands_.size(); ++i) {
-            const auto& b = bands_[i];
-            RCLCPP_INFO(this->get_logger(),
-                        "  档%zu r=%.2f size_xy=%.3f size_z=%.3f thr_z=%.3f",
-                        i, b.r, b.size_xy, b.size_z, b.thr_z);
-        }
+        RCLCPP_INFO(this->get_logger(),
+                    "  我们的雷达中心立方体: L=%.2f W=%.2f H=%.2f",
+                    cube_length_, cube_width_, cube_height_);
+        RCLCPP_INFO(this->get_logger(),
+                    "  角分辨率 ang_h=%.6f ang_v=%.6f, base_xy=%.3f base_z=%.3f, thr_ratio=%.2f",
+                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_);
+        logVoxelScaleSamples();
     }
 }
 
@@ -421,19 +428,17 @@ void CloudPassthroughFilterNode::cloud_callback(
         replace_current(current, filtered);
     }
 
-    // 直通滤波到这里结束。体素删点接在下面，enable_voxel_filter 打开后走。
+    // 直通滤波到这里结束，current 是直通后的点云，参数不要动。
+    // current → 我们的立方体(框外跳过) → 框内切小体素 → 收集坏体素 → 按列表删点
     if (enable_voxel_filter_ && current && !current->empty()) {
         grid_.clear();
+        fine_grid_.clear();
         buildVoxelGrid(current);
-        markFlatVoxels();
-        auto kept = extractByFlag(current, true);
-        if (debug_mode_ && removed_publisher_) {
-            auto removed = extractByFlag(current, false);
-            publish_cloud(removed, msg->header, removed_publisher_, "被删点");
-            memory_pool_->release(removed);
-        }
-        replace_current(current, kept);
-        PT_INFO("体素删点后: %zu → %zu 点", n_in, current->size());
+        const size_t n_before_voxel = current->size();
+        std::vector<Voxel*> bad_voxels = collectBadVoxels();
+        removePointsInBadVoxels(current, bad_voxels, msg->header);
+        PT_INFO("体素删点结束: 坏格 %zu, 点数 %zu → %zu",
+                bad_voxels.size(), n_before_voxel, current->size());
     }
 
     publish_cloud(current, msg->header, publisher_, "最终输出");
@@ -447,46 +452,62 @@ void CloudPassthroughFilterNode::cloud_callback(
 
 // ---------- 体素删点 ----------
 
-void CloudPassthroughFilterNode::buildVoxelSizeTable()
+void CloudPassthroughFilterNode::logVoxelScaleSamples() const
 {
-    // 开机算近、远两套格子尺寸和删点门槛，回调只查表
-    const double r_near = std::max(r_max_ * 0.5, 1e-3);
-    const double r_far = std::max(r_max_, r_near + 1e-3);
-    const double r_list[2] = {r_near, r_far};
-
-    for (size_t i = 0; i < bands_.size(); ++i) {
-        VoxelBand& b = bands_[i];
-        b.r = r_list[i];
-        b.line_gap = b.r * ang_v_;
-        b.pt_gap = b.r * ang_h_;
-
-        // 线间距是基础边长的几倍，向上取整；再夹到上限
-        const double mult_z = std::max(1.0, std::ceil(b.line_gap / std::max(base_z_, 1e-6)));
-        const double mult_xy = std::max(1.0, std::ceil(b.pt_gap / std::max(base_xy_, 1e-6)));
-        b.size_z = std::min(base_z_ * mult_z, max_z_);
-        b.size_xy = std::min(base_xy_ * mult_xy, max_xy_);
-        b.thr_z = b.line_gap * thr_ratio_;
-
-        // 竖直格子至少盖住两条扫描线，否则墙上每格也只有一条线，会全删
-        const double min_size_z = 2.0 * b.line_gap;
-        if (b.size_z < min_size_z) {
-            RCLCPP_WARN(this->get_logger(),
-                        "档%zu size_z=%.4f < 2*line_gap=%.4f，抬到 %.4f",
-                        i, b.size_z, min_size_z, min_size_z);
-            b.size_z = min_size_z;
-        }
-        // 门槛必须小于格子高度，否则跨度永远够不着，等于不删
-        if (b.thr_z >= b.size_z) {
-            const double new_thr = 0.5 * b.size_z;
-            RCLCPP_WARN(this->get_logger(),
-                        "档%zu thr_z=%.4f >= size_z=%.4f，压到 %.4f",
-                        i, b.thr_z, b.size_z, new_thr);
-            b.thr_z = new_thr;
-        }
-
-        b.inv_xy = 1.0 / std::max(b.size_xy, 1e-6);
-        b.inv_z = 1.0 / std::max(b.size_z, 1e-6);
+    const double samples[] = {1.0, 2.0, 4.0, std::max(r_max_, 1.0)};
+    for (double r : samples) {
+        const VoxelScale s = computeVoxelScale(r);
+        RCLCPP_INFO(this->get_logger(),
+                    "  样例 r=%.1f line_gap=%.4f mult_xy=%d mult_z=%d "
+                    "size_xy=%.3f size_z=%.3f thr_z=%.4f",
+                    r, s.line_gap, s.mult_xy, s.mult_z, s.size_xy, s.size_z, s.thr_z);
     }
+}
+
+VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
+{
+    VoxelScale s;
+    const double rr = std::max(r, 1e-3);
+
+    // 当前距离上，相邻扫描线 / 相邻点的真实间距，跟角分辨率挂钩，随距离线性变大
+    s.line_gap = rr * ang_v_;
+    s.pt_gap = rr * ang_h_;
+
+    // 间距是默认边长的几倍，向上取整；长宽和 z 各一套倍率
+    s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.line_gap / std::max(base_z_, 1e-6))));
+    s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.pt_gap / std::max(base_xy_, 1e-6))));
+    s.size_z = std::min(base_z_ * static_cast<double>(s.mult_z), max_z_);
+    s.size_xy = std::min(base_xy_ * static_cast<double>(s.mult_xy), max_xy_);
+
+    // 删点门槛：半条线间距，随距离线性变大
+    s.thr_z = s.line_gap * thr_ratio_;
+
+    // 竖直格子至少盖住两条扫描线，否则墙上每格也只有一条线，会全删
+    const double min_size_z = 2.0 * s.line_gap;
+    if (s.size_z < min_size_z) {
+        s.size_z = min_size_z;
+        s.mult_z = static_cast<int>(std::max(
+            1.0, std::ceil(s.size_z / std::max(base_z_, 1e-6))));
+    }
+    // 门槛必须小于格子高度，否则跨度永远够不着，等于不删
+    if (s.thr_z >= s.size_z) {
+        s.thr_z = 0.5 * s.size_z;
+    }
+
+    s.inv_xy = 1.0 / std::max(s.size_xy, 1e-6);
+    s.inv_z = 1.0 / std::max(s.size_z, 1e-6);
+    return s;
+}
+
+bool CloudPassthroughFilterNode::inOurCube(float x, float y, float z) const
+{
+    // 以雷达原点为中心的立方体
+    const double half_l = 0.5 * cube_length_;
+    const double half_w = 0.5 * cube_width_;
+    const double half_h = 0.5 * cube_height_;
+    return std::fabs(static_cast<double>(x)) <= half_l &&
+           std::fabs(static_cast<double>(y)) <= half_w &&
+           std::fabs(static_cast<double>(z)) <= half_h;
 }
 
 void CloudPassthroughFilterNode::buildVoxelGrid(
@@ -496,8 +517,12 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
         return;
     }
 
+    // 只把落在立方体里的点装进细格；框外的点不做操作，后面原样留下
+    const double inv_xy = 1.0 / std::max(base_xy_, 1e-6);
+    const double inv_z = 1.0 / std::max(base_z_, 1e-6);
     const uint32_t n = static_cast<uint32_t>(cloud->points.size());
     uint32_t loaded = 0;
+    uint32_t skipped_outside = 0;
 
     for (uint32_t i = 0; i < n; ++i) {
         const auto& p = cloud->points[i];
@@ -505,28 +530,28 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
             continue;
         }
 
-        const double r = std::hypot(static_cast<double>(p.x), static_cast<double>(p.y));
-        if (r > r_max_) {
+        if (!inOurCube(p.x, p.y, p.z)) {
+            ++skipped_outside;
             continue;
         }
 
-        const int band = pickBand(r);
-        const VoxelBand& b = bands_[static_cast<size_t>(band)];
+        const int ix = static_cast<int>(std::floor(static_cast<double>(p.x) * inv_xy));
+        const int iy = static_cast<int>(std::floor(static_cast<double>(p.y) * inv_xy));
+        const int iz = static_cast<int>(std::floor(static_cast<double>(p.z) * inv_z));
+        const int64_t key = makeKey(ix, iy, iz);
 
-        const int ix = static_cast<int>(std::floor(static_cast<double>(p.x) * b.inv_xy));
-        const int iy = static_cast<int>(std::floor(static_cast<double>(p.y) * b.inv_xy));
-        const int iz = static_cast<int>(std::floor(static_cast<double>(p.z) * b.inv_z));
-
-        const int64_t key = makeKey(band, ix, iy, iz);
-        auto it = grid_.find(key);
-        if (it == grid_.end()) {
+        auto it = fine_grid_.find(key);
+        if (it == fine_grid_.end()) {
             Voxel v;
+            v.ix = ix;
+            v.iy = iy;
+            v.iz = iz;
             v.count = 1;
             v.zmin = p.z;
             v.zmax = p.z;
             v.idx.push_back(i);
             v.keep = true;
-            grid_.emplace(key, std::move(v));
+            fine_grid_.emplace(key, std::move(v));
         } else {
             Voxel& v = it->second;
             ++v.count;
@@ -541,113 +566,213 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
         ++loaded;
     }
 
-    PT_INFO("体素装格: %u 点装入 %zu 格", loaded, grid_.size());
+    mergeFineVoxels();
+    PT_INFO("体素装格: 框内 %u 点, 框外跳过 %u, 细格 %zu, 合成后 %zu 格",
+            loaded, skipped_outside, fine_grid_.size(), grid_.size());
 }
 
-void CloudPassthroughFilterNode::markFlatVoxels()
+void CloudPassthroughFilterNode::mergeFineVoxels()
 {
-    size_t kept = 0;
-    size_t dropped = 0;
+    struct ScaleN {
+        int nxy{1};
+        int nz{1};
+    };
+    std::unordered_map<int64_t, ScaleN> scale_n;
+    scale_n.reserve(fine_grid_.size());
+
+    for (const auto& entry : fine_grid_) {
+        const Voxel& v = entry.second;
+        const double cx = (static_cast<double>(v.ix) + 0.5) * base_xy_;
+        const double cy = (static_cast<double>(v.iy) + 0.5) * base_xy_;
+        const double r = std::hypot(cx, cy);
+        const VoxelScale s = computeVoxelScale(r);
+        scale_n[entry.first] = ScaleN{s.mult_xy, s.mult_z};
+    }
+
+    for (auto& entry : fine_grid_) {
+        const Voxel& fine = entry.second;
+        ScaleN n = scale_n[entry.first];
+
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    const int64_t nk = makeKey(fine.ix + dx, fine.iy + dy, fine.iz + dz);
+                    auto nit = scale_n.find(nk);
+                    if (nit == scale_n.end()) {
+                        continue;
+                    }
+                    if (nit->second.nxy > n.nxy) {
+                        n.nxy = nit->second.nxy;
+                    }
+                    if (nit->second.nz > n.nz) {
+                        n.nz = nit->second.nz;
+                    }
+                }
+            }
+        }
+
+        const int cx = floorDiv(fine.ix, n.nxy);
+        const int cy = floorDiv(fine.iy, n.nxy);
+        const int cz = floorDiv(fine.iz, n.nz);
+        const int64_t ckey = makeKey(cx, cy, cz);
+
+        const double center_x = (static_cast<double>(fine.ix) + 0.5) * base_xy_;
+        const double center_y = (static_cast<double>(fine.iy) + 0.5) * base_xy_;
+        const float cell_r = static_cast<float>(std::hypot(center_x, center_y));
+
+        auto it = grid_.find(ckey);
+        if (it == grid_.end()) {
+            Voxel v;
+            v.ix = cx;
+            v.iy = cy;
+            v.iz = cz;
+            v.count = fine.count;
+            v.zmin = fine.zmin;
+            v.zmax = fine.zmax;
+            v.r = cell_r;
+            v.idx = fine.idx;
+            v.keep = true;
+            grid_.emplace(ckey, std::move(v));
+        } else {
+            Voxel& v = it->second;
+            v.count += fine.count;
+            if (fine.zmin < v.zmin) {
+                v.zmin = fine.zmin;
+            }
+            if (fine.zmax > v.zmax) {
+                v.zmax = fine.zmax;
+            }
+            if (cell_r > v.r) {
+                v.r = cell_r;
+            }
+            v.idx.insert(v.idx.end(), fine.idx.begin(), fine.idx.end());
+        }
+    }
 
     for (auto& entry : grid_) {
-        const int64_t key = entry.first;
         Voxel& v = entry.second;
-
-        const int band = static_cast<int>((key >> 60) & 0x3);
-        const size_t bi = static_cast<size_t>(std::clamp(band, 0, 1));
-        const float thr = static_cast<float>(bands_[bi].thr_z);
-        const float span = v.zmax - v.zmin;
-
-        v.keep = span >= thr;
-        if (v.keep) {
-            ++kept;
-        } else {
-            ++dropped;
-        }
+        const VoxelScale s = computeVoxelScale(static_cast<double>(v.r));
+        v.thr_z = static_cast<float>(s.thr_z);
     }
-
-    PT_INFO("体素判平: 留 %zu 格, 删 %zu 格", kept, dropped);
 }
 
-pcl::PointCloud<pcl::PointXYZ>::Ptr CloudPassthroughFilterNode::extractByFlag(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-    bool want_keep)
+int CloudPassthroughFilterNode::floorDiv(int a, int b) const
 {
-    auto out = memory_pool_->acquire();
-    out->height = 1;
-    out->is_dense = true;
-
-    if (!cloud || cloud->empty()) {
-        out->width = 0;
-        return out;
+    const int d = std::max(b, 1);
+    if (a >= 0) {
+        return a / d;
     }
-
-    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
-    std::vector<char> assigned(n, 0);
-    for (const auto& entry : grid_) {
-        for (uint32_t idx : entry.second.idx) {
-            if (idx < n) {
-                assigned[idx] = 1;
-            }
-        }
-    }
-
-    size_t out_count = 0;
-    for (const auto& entry : grid_) {
-        if (entry.second.keep == want_keep) {
-            out_count += entry.second.idx.size();
-        }
-    }
-    if (want_keep) {
-        for (uint32_t i = 0; i < n; ++i) {
-            if (!assigned[i]) {
-                ++out_count;
-            }
-        }
-    }
-
-    out->points.reserve(out_count);
-    for (const auto& entry : grid_) {
-        if (entry.second.keep != want_keep) {
-            continue;
-        }
-        for (uint32_t idx : entry.second.idx) {
-            if (idx < n) {
-                out->points.push_back(cloud->points[idx]);
-            }
-        }
-    }
-    if (want_keep) {
-        for (uint32_t i = 0; i < n; ++i) {
-            if (!assigned[i]) {
-                out->points.push_back(cloud->points[i]);
-            }
-        }
-    }
-
-    out->width = static_cast<uint32_t>(out->points.size());
-    PT_INFO("体素抽点(%s): %zu → %zu",
-            want_keep ? "保留" : "删除",
-            cloud->size(),
-            out->size());
-    return out;
+    return static_cast<int>(std::floor(static_cast<double>(a) / static_cast<double>(d)));
 }
 
-int CloudPassthroughFilterNode::pickBand(double r) const
-{
-    if (r < r_max_ * 0.5) {
-        return 0;
-    }
-    return 1;
-}
-
-int64_t CloudPassthroughFilterNode::makeKey(int band, int ix, int iy, int iz) const
+int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
 {
     constexpr int64_t kOffset = 1 << 19;
     const int64_t ux = static_cast<int64_t>(ix) + kOffset;
     const int64_t uy = static_cast<int64_t>(iy) + kOffset;
     const int64_t uz = static_cast<int64_t>(iz) + kOffset;
-    return (static_cast<int64_t>(band) << 60) | (ux << 40) | (uy << 20) | uz;
+    return (ux << 40) | (uy << 20) | uz;
+}
+
+std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
+{
+    std::vector<Voxel*> bad;
+    bad.reserve(grid_.size());
+
+    size_t keep_n = 0;
+    float sample_span = 0.0f;
+    float sample_thr = 0.0f;
+    bool have_sample = false;
+
+    for (auto& entry : grid_) {
+        Voxel& v = entry.second;
+        const float span = v.zmax - v.zmin;
+        if (span < v.thr_z) {
+            bad.push_back(&v);
+            if (!have_sample) {
+                sample_span = span;
+                sample_thr = v.thr_z;
+                have_sample = true;
+            }
+        } else {
+            ++keep_n;
+        }
+    }
+
+    PT_INFO("坏体素判定: 总格 %zu, 坏 %zu, 留 %zu",
+            grid_.size(), bad.size(), keep_n);
+    if (have_sample) {
+        PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
+    }
+    return bad;
+}
+
+void CloudPassthroughFilterNode::removePointsInBadVoxels(
+    pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<Voxel*>& bad_voxels,
+    const std_msgs::msg::Header& header)
+{
+    if (!cloud) {
+        PT_WARN("删点: 点云为空, 跳过");
+        return;
+    }
+    if (bad_voxels.empty()) {
+        PT_INFO("删点: 无坏体素, 点数保持 %zu", cloud->size());
+        return;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
+    std::vector<char> drop(n, 0);
+    size_t marked = 0;
+    for (const Voxel* v : bad_voxels) {
+        if (!v) {
+            continue;
+        }
+        for (uint32_t idx : v->idx) {
+            if (idx < n && drop[idx] == 0) {
+                drop[idx] = 1;
+                ++marked;
+            }
+        }
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr removed;
+    if (debug_mode_ && removed_publisher_) {
+        removed = memory_pool_->acquire();
+        removed->height = 1;
+        removed->is_dense = true;
+        removed->points.reserve(marked);
+    }
+
+    size_t write = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (drop[i] != 0) {
+            if (removed) {
+                removed->points.push_back(cloud->points[i]);
+            }
+            continue;
+        }
+        if (write != static_cast<size_t>(i)) {
+            cloud->points[write] = cloud->points[i];
+        }
+        ++write;
+    }
+    cloud->points.resize(write);
+    cloud->width = static_cast<uint32_t>(write);
+    cloud->height = 1;
+    cloud->is_dense = true;
+
+    PT_INFO("删点: 坏格 %zu, 去掉 %zu 点, %u → %zu",
+            bad_voxels.size(), marked, n, cloud->size());
+
+    if (removed) {
+        removed->width = static_cast<uint32_t>(removed->points.size());
+        publish_cloud(removed, header, removed_publisher_, "被删点");
+        memory_pool_->release(removed);
+    }
 }
 
 int main(int argc, char* argv[])

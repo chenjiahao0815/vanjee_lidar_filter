@@ -18,7 +18,7 @@ cloud_passthrough_filter_node:
     limit_min_z: -0.2
     limit_max_z: 0.4
 
-    debug_mode: false
+    debug_mode: true
     debug_topic_x: "/vanjee/passthrough_x"
     debug_topic_y: "/vanjee/passthrough_y"
     debug_topic_z: "/vanjee/passthrough_z"
@@ -27,8 +27,14 @@ cloud_passthrough_filter_node:
     memory_pool_reserve: 1000000
     cloud_log_interval_sec: 1.0
 
+    # 我们自己的立方体，雷达中心，长宽高
+    cube_length: 4.0
+    cube_width: 4.0
+    cube_height: 2.0
+
+    # 体素边长 = base × 整数倍率；倍率 = ceil(距离×角分辨率 / base)
     removed_topic: "/vanjee/lidar_removed"
-    enable_voxel_filter: false
+    enable_voxel_filter: true
     ang_h: 0.0034906585
     ang_v: 0.0174532925
     r_max: 8.0
