@@ -63,6 +63,11 @@ struct Voxel {
     float zmax{0.0f};
     float thr_z{0.0f};
     float r{0.0f};
+    float cx{0.0f};
+    float cy{0.0f};
+    float size_xy{0.0f};
+    float size_z{0.0f};
+    uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
     bool keep{true};
 };
@@ -112,6 +117,9 @@ private:
         const std_msgs::msg::Header& header);
     int64_t makeKey(int ix, int iy, int iz) const;
     int floorDiv(int a, int b) const;
+    int ringId(float x, float y, float z) const;
+    void addRing(Voxel& v, float x, float y, float z) const;
+    bool hasNeighborSupport(const Voxel& v, const std::vector<Voxel*>& all) const;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
@@ -145,8 +153,8 @@ private:
     double ang_h_{0.0};
     double ang_v_{0.0};
     double r_max_{8.0};
-    double base_xy_{0.05};
-    double base_z_{0.05};
+    double base_xy_{0.01};
+    double base_z_{0.01};
     double max_xy_{0.5};
     double max_z_{0.5};
     double thr_ratio_{0.5};

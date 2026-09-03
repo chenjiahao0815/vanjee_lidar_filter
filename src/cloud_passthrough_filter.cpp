@@ -122,8 +122,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("ang_h", 0.0034906585);   // 约 0.2 deg
     this->declare_parameter("ang_v", 0.0174532925);   // 约 1.0 deg
     this->declare_parameter("r_max", 8.0);
-    this->declare_parameter("base_xy", 0.05);
-    this->declare_parameter("base_z", 0.05);
+    this->declare_parameter("base_xy", 0.01);
+    this->declare_parameter("base_z", 0.01);
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
     this->declare_parameter("thr_ratio", 0.5);
@@ -270,7 +270,8 @@ void CloudPassthroughFilterNode::log_startup() const
                     "  我们的雷达中心立方体: L=%.2f W=%.2f H=%.2f",
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
-                    "  角分辨率 ang_h=%.6f ang_v=%.6f, base_xy=%.3f base_z=%.3f, thr_ratio=%.2f",
+                    "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
+                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f",
                     ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_);
         logVoxelScaleSamples();
     }
@@ -468,28 +469,20 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
 {
     VoxelScale s;
     const double rr = std::max(r, 1e-3);
+    const double base_xy = std::max(base_xy_, 1e-6);
+    const double base_z = std::max(base_z_, 1e-6);
 
-    // 当前距离上，相邻扫描线 / 相邻点的真实间距，跟角分辨率挂钩，随距离线性变大
+    // 线间距随距离变大。横向跟这条线间距走，纵向盖住两条线
     s.line_gap = rr * ang_v_;
-    s.pt_gap = rr * ang_h_;
+    s.pt_gap = s.line_gap;
+    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);
+    s.size_z = std::min(std::max(2.0 * s.line_gap, base_z), max_z_);
+    s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy)));
+    s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z)));
+    s.size_xy = std::min(base_xy * static_cast<double>(s.mult_xy), max_xy_);
+    s.size_z = std::min(base_z * static_cast<double>(s.mult_z), max_z_);
 
-    // 间距是默认边长的几倍，向上取整；长宽和 z 各一套倍率
-    s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.line_gap / std::max(base_z_, 1e-6))));
-    s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.pt_gap / std::max(base_xy_, 1e-6))));
-    s.size_z = std::min(base_z_ * static_cast<double>(s.mult_z), max_z_);
-    s.size_xy = std::min(base_xy_ * static_cast<double>(s.mult_xy), max_xy_);
-
-    // 删点门槛：半条线间距，随距离线性变大
     s.thr_z = s.line_gap * thr_ratio_;
-
-    // 竖直格子至少盖住两条扫描线，否则墙上每格也只有一条线，会全删
-    const double min_size_z = 2.0 * s.line_gap;
-    if (s.size_z < min_size_z) {
-        s.size_z = min_size_z;
-        s.mult_z = static_cast<int>(std::max(
-            1.0, std::ceil(s.size_z / std::max(base_z_, 1e-6))));
-    }
-    // 门槛必须小于格子高度，否则跨度永远够不着，等于不删
     if (s.thr_z >= s.size_z) {
         s.thr_z = 0.5 * s.size_z;
     }
@@ -549,8 +542,11 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
             v.count = 1;
             v.zmin = p.z;
             v.zmax = p.z;
+            v.cx = static_cast<float>((static_cast<double>(ix) + 0.5) * base_xy_);
+            v.cy = static_cast<float>((static_cast<double>(iy) + 0.5) * base_xy_);
             v.idx.push_back(i);
             v.keep = true;
+            addRing(v, p.x, p.y, p.z);
             fine_grid_.emplace(key, std::move(v));
         } else {
             Voxel& v = it->second;
@@ -562,6 +558,7 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
                 v.zmax = p.z;
             }
             v.idx.push_back(i);
+            addRing(v, p.x, p.y, p.z);
         }
         ++loaded;
     }
@@ -633,11 +630,19 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
             v.zmin = fine.zmin;
             v.zmax = fine.zmax;
             v.r = cell_r;
+            v.cx = static_cast<float>(center_x);
+            v.cy = static_cast<float>(center_y);
+            v.ring_mask = fine.ring_mask;
             v.idx = fine.idx;
             v.keep = true;
             grid_.emplace(ckey, std::move(v));
         } else {
             Voxel& v = it->second;
+            const double w_old = static_cast<double>(v.count);
+            const double w_new = static_cast<double>(fine.count);
+            const double w = std::max(w_old + w_new, 1.0);
+            v.cx = static_cast<float>((static_cast<double>(v.cx) * w_old + center_x * w_new) / w);
+            v.cy = static_cast<float>((static_cast<double>(v.cy) * w_old + center_y * w_new) / w);
             v.count += fine.count;
             if (fine.zmin < v.zmin) {
                 v.zmin = fine.zmin;
@@ -648,6 +653,7 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
             if (cell_r > v.r) {
                 v.r = cell_r;
             }
+            v.ring_mask |= fine.ring_mask;
             v.idx.insert(v.idx.end(), fine.idx.begin(), fine.idx.end());
         }
     }
@@ -656,6 +662,8 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
         Voxel& v = entry.second;
         const VoxelScale s = computeVoxelScale(static_cast<double>(v.r));
         v.thr_z = static_cast<float>(s.thr_z);
+        v.size_xy = static_cast<float>(s.size_xy);
+        v.size_z = static_cast<float>(s.size_z);
     }
 }
 
@@ -677,33 +685,95 @@ int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
     return (ux << 40) | (uy << 20) | uz;
 }
 
+int CloudPassthroughFilterNode::ringId(float x, float y, float z) const
+{
+    const double rxy = std::hypot(static_cast<double>(x), static_cast<double>(y));
+    return static_cast<int>(std::llround(
+        std::atan2(static_cast<double>(z), std::max(rxy, 1e-6)) / std::max(ang_v_, 1e-6)));
+}
+
+void CloudPassthroughFilterNode::addRing(Voxel& v, float x, float y, float z) const
+{
+    constexpr int kBias = 32;
+    const int bit = ringId(x, y, z) + kBias;
+    if (bit >= 0 && bit < 64) {
+        v.ring_mask |= (1ull << bit);
+    }
+}
+
+bool CloudPassthroughFilterNode::hasNeighborSupport(
+    const Voxel& v, const std::vector<Voxel*>& all) const
+{
+    const float line_gap = std::max(v.r, 1e-3f) * static_cast<float>(ang_v_);
+    const float search_xy = std::max(v.size_xy, line_gap);
+    const float search_z = 2.5f * line_gap;
+    const float search_xy2 = search_xy * search_xy;
+
+    for (const Voxel* other : all) {
+        if (!other || other == &v) {
+            continue;
+        }
+        const float dx = other->cx - v.cx;
+        const float dy = other->cy - v.cy;
+        if (dx * dx + dy * dy > search_xy2) {
+            continue;
+        }
+
+        float gap_z = 0.0f;
+        if (other->zmin > v.zmax) {
+            gap_z = other->zmin - v.zmax;
+        } else if (v.zmin > other->zmax) {
+            gap_z = v.zmin - other->zmax;
+        }
+        if (gap_z > search_z) {
+            continue;
+        }
+
+        if ((other->ring_mask & ~v.ring_mask) != 0ull) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 {
+    std::vector<Voxel*> all;
+    all.reserve(grid_.size());
+    for (auto& entry : grid_) {
+        all.push_back(&entry.second);
+    }
+
     std::vector<Voxel*> bad;
     bad.reserve(grid_.size());
 
-    size_t keep_n = 0;
+    size_t thick_n = 0;
+    size_t rescued_n = 0;
     float sample_span = 0.0f;
     float sample_thr = 0.0f;
     bool have_sample = false;
 
-    for (auto& entry : grid_) {
-        Voxel& v = entry.second;
+    for (Voxel* vp : all) {
+        Voxel& v = *vp;
         const float span = v.zmax - v.zmin;
-        if (span < v.thr_z) {
-            bad.push_back(&v);
-            if (!have_sample) {
-                sample_span = span;
-                sample_thr = v.thr_z;
-                have_sample = true;
-            }
-        } else {
-            ++keep_n;
+        if (span >= v.thr_z) {
+            ++thick_n;
+            continue;
+        }
+        if (hasNeighborSupport(v, all)) {
+            ++rescued_n;
+            continue;
+        }
+        bad.push_back(&v);
+        if (!have_sample) {
+            sample_span = span;
+            sample_thr = v.thr_z;
+            have_sample = true;
         }
     }
 
-    PT_INFO("坏体素判定: 总格 %zu, 坏 %zu, 留 %zu",
-            grid_.size(), bad.size(), keep_n);
+    PT_INFO("坏体素判定: 总格 %zu, 厚留 %zu, 邻域救回 %zu, 坏 %zu",
+            grid_.size(), thick_n, rescued_n, bad.size());
     if (have_sample) {
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }

@@ -32,14 +32,14 @@ cloud_passthrough_filter_node:
     cube_width: 4.0
     cube_height: 2.0
 
-    # 体素边长 = base × 整数倍率；倍率 = ceil(距离×角分辨率 / base)
+    # 细格 base；合成后横向=1×线间距，纵向=2×线间距
     removed_topic: "/vanjee/lidar_removed"
     enable_voxel_filter: true
     ang_h: 0.0034906585
     ang_v: 0.0174532925
     r_max: 8.0
-    base_xy: 0.05
-    base_z: 0.05
+    base_xy: 0.01
+    base_z: 0.01
     max_xy: 0.5
     max_z: 0.5
     thr_ratio: 0.5
