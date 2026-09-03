@@ -160,7 +160,9 @@ private:
     double max_xy_{0.5};
     double max_z_{0.5};
     double thr_ratio_{0.5};
-    double cluster_link_m_{0.12};
+    double cluster_link_m_{0.18};
+    double cluster_link_k_{6.0};
+    double cluster_plane_k_{10.0};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;

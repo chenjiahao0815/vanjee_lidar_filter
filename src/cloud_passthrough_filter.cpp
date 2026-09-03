@@ -128,7 +128,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
     this->declare_parameter("thr_ratio", 0.5);
-    this->declare_parameter("cluster_link_m", 0.12);
+    this->declare_parameter("cluster_link_m", 0.18);
+    this->declare_parameter("cluster_link_k", 6.0);
+    this->declare_parameter("cluster_plane_k", 10.0);
 
     input_topic_ = this->get_parameter("input_topic").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
@@ -164,8 +166,16 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     max_z_ = this->get_parameter("max_z").as_double();
     thr_ratio_ = this->get_parameter("thr_ratio").as_double();
     cluster_link_m_ = this->get_parameter("cluster_link_m").as_double();
+    cluster_link_k_ = this->get_parameter("cluster_link_k").as_double();
+    cluster_plane_k_ = this->get_parameter("cluster_plane_k").as_double();
     if (cluster_link_m_ <= 0.0) {
-        cluster_link_m_ = 0.12;
+        cluster_link_m_ = 0.18;
+    }
+    if (cluster_link_k_ <= 0.0) {
+        cluster_link_k_ = 6.0;
+    }
+    if (cluster_plane_k_ <= 0.0) {
+        cluster_plane_k_ = 10.0;
     }
 
     axes_[0].name = 'x';
@@ -277,8 +287,10 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f, 连通团=%.2f m",
-                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_, cluster_link_m_);
+                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f, "
+                    "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
+                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_,
+                    cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         logVoxelScaleSamples();
     }
 }
@@ -435,8 +447,8 @@ void CloudPassthroughFilterNode::cloud_callback(
         replace_current(current, filtered);
     }
 
-    // 直通滤波到这里结束，current 是直通后的点云，参数不要动。
-    // current → 我们的立方体(框外跳过) → 框内切小体素 → 收集坏体素 → 按列表删点
+    // 直通滤波到这里结束，current 是直通后的点云
+
     if (enable_voxel_filter_ && current && !current->empty()) {
         grid_.clear();
         fine_grid_.clear();
@@ -711,7 +723,7 @@ bool CloudPassthroughFilterNode::hasNeighborSupport(
     const Voxel& v, const std::vector<Voxel*>& all) const
 {
     const float line_gap = std::max(v.r, 1e-3f) * static_cast<float>(ang_v_);
-    const float search_xy = std::max(v.size_xy, line_gap);
+    const float search_xy = 1.5f * std::max(v.size_xy, line_gap);
     const float search_z = 2.5f * line_gap;
     const float search_xy2 = search_xy * search_xy;
 
@@ -783,8 +795,10 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
         }
     };
 
-    const float link = static_cast<float>(cluster_link_m_);
-    const float link2 = link * link;
+    const float k3d = static_cast<float>(cluster_link_k_);
+    const float kxy = static_cast<float>(cluster_plane_k_);
+    const float link_min = static_cast<float>(cluster_link_m_);
+    const float ang = static_cast<float>(ang_v_);
     for (size_t i = 0; i < n; ++i) {
         const Voxel* a = all[i];
         const float za = 0.5f * (a->zmin + a->zmax);
@@ -794,7 +808,20 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
             const float dy = a->cy - b->cy;
             const float zb = 0.5f * (b->zmin + b->zmax);
             const float dz = za - zb;
-            if (dx * dx + dy * dy + dz * dz <= link2) {
+            const float rr = std::max(std::max(a->r, b->r), 1e-3f);
+            const float gap = rr * ang;
+            const float link3d = std::max(link_min, k3d * gap);
+            const float dxy2 = dx * dx + dy * dy;
+            const float d3 = dxy2 + dz * dz;
+            bool join = (d3 <= link3d * link3d);
+            if (!join) {
+                const float z_band = std::max(0.04f, 2.0f * gap);
+                const float link_xy = std::max(link3d, kxy * gap);
+                if (std::fabs(dz) <= z_band && dxy2 <= link_xy * link_xy) {
+                    join = true;
+                }
+            }
+            if (join) {
                 unite(static_cast<int>(i), static_cast<int>(j));
             }
         }
@@ -825,8 +852,9 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
             protect_pts += all[i]->count;
         }
     }
-    PT_INFO("连通团保护: 多线团 %zu, 保护 %zu 格 / %zu 点 (link=%.2f m)",
-            multi_n, protect_voxels, protect_pts, cluster_link_m_);
+    PT_INFO("连通团保护: 多线团 %zu, 保护 %zu 格 / %zu 点 (link=%.2f k3d=%.1f k_xy=%.1f)",
+            multi_n, protect_voxels, protect_pts,
+            cluster_link_m_, cluster_link_k_, cluster_plane_k_);
 }
 
 std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
