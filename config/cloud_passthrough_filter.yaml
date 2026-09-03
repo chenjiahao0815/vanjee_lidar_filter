@@ -43,3 +43,5 @@ cloud_passthrough_filter_node:
     max_xy: 0.5
     max_z: 0.5
     thr_ratio: 0.5
+    # 连通团边长；整团≥2条扫描线则整团保护，不按格子删
+    cluster_link_m: 0.12

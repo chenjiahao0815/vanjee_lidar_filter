@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
+#include <vector>
 
 #define PT_INFO(...) \
     do { if (shouldFrameLog()) { RCLCPP_INFO(this->get_logger(), __VA_ARGS__); } } while (0)
@@ -127,6 +128,7 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
     this->declare_parameter("thr_ratio", 0.5);
+    this->declare_parameter("cluster_link_m", 0.12);
 
     input_topic_ = this->get_parameter("input_topic").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
@@ -161,6 +163,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     max_xy_ = this->get_parameter("max_xy").as_double();
     max_z_ = this->get_parameter("max_z").as_double();
     thr_ratio_ = this->get_parameter("thr_ratio").as_double();
+    cluster_link_m_ = this->get_parameter("cluster_link_m").as_double();
+    if (cluster_link_m_ <= 0.0) {
+        cluster_link_m_ = 0.12;
+    }
 
     axes_[0].name = 'x';
     axes_[0].dim = 0;
@@ -271,8 +277,8 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f",
-                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_);
+                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f, 连通团=%.2f m",
+                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_, cluster_link_m_);
         logVoxelScaleSamples();
     }
 }
@@ -736,6 +742,93 @@ bool CloudPassthroughFilterNode::hasNeighborSupport(
     return false;
 }
 
+int CloudPassthroughFilterNode::ringBitCount(uint64_t mask)
+{
+    int n = 0;
+    while (mask != 0ull) {
+        n += static_cast<int>(mask & 1ull);
+        mask >>= 1;
+    }
+    return n;
+}
+
+void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
+{
+    const size_t n = all.size();
+    for (Voxel* v : all) {
+        if (v) {
+            v->keep = false;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+
+    std::vector<int> parent(static_cast<int>(n));
+    for (size_t i = 0; i < n; ++i) {
+        parent[i] = static_cast<int>(i);
+    }
+    auto find = [&](int x) {
+        while (parent[static_cast<size_t>(x)] != x) {
+            parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+            x = parent[static_cast<size_t>(x)];
+        }
+        return x;
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) {
+            parent[static_cast<size_t>(b)] = a;
+        }
+    };
+
+    const float link = static_cast<float>(cluster_link_m_);
+    const float link2 = link * link;
+    for (size_t i = 0; i < n; ++i) {
+        const Voxel* a = all[i];
+        const float za = 0.5f * (a->zmin + a->zmax);
+        for (size_t j = i + 1; j < n; ++j) {
+            const Voxel* b = all[j];
+            const float dx = a->cx - b->cx;
+            const float dy = a->cy - b->cy;
+            const float zb = 0.5f * (b->zmin + b->zmax);
+            const float dz = za - zb;
+            if (dx * dx + dy * dy + dz * dz <= link2) {
+                unite(static_cast<int>(i), static_cast<int>(j));
+            }
+        }
+    }
+
+    std::vector<uint64_t> root_mask(n, 0ull);
+    for (size_t i = 0; i < n; ++i) {
+        const int r = find(static_cast<int>(i));
+        root_mask[static_cast<size_t>(r)] |= all[i]->ring_mask;
+    }
+
+    size_t multi_n = 0;
+    size_t protect_voxels = 0;
+    size_t protect_pts = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (find(static_cast<int>(i)) != static_cast<int>(i)) {
+            continue;
+        }
+        if (ringBitCount(root_mask[i]) >= 2) {
+            ++multi_n;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const int r = find(static_cast<int>(i));
+        if (ringBitCount(root_mask[static_cast<size_t>(r)]) >= 2) {
+            all[i]->keep = true;
+            ++protect_voxels;
+            protect_pts += all[i]->count;
+        }
+    }
+    PT_INFO("连通团保护: 多线团 %zu, 保护 %zu 格 / %zu 点 (link=%.2f m)",
+            multi_n, protect_voxels, protect_pts, cluster_link_m_);
+}
+
 std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 {
     std::vector<Voxel*> all;
@@ -743,10 +836,12 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
     for (auto& entry : grid_) {
         all.push_back(&entry.second);
     }
+    markMultiRingClusters(all);
 
     std::vector<Voxel*> bad;
     bad.reserve(grid_.size());
 
+    size_t cluster_n = 0;
     size_t thick_n = 0;
     size_t rescued_n = 0;
     float sample_span = 0.0f;
@@ -755,6 +850,10 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 
     for (Voxel* vp : all) {
         Voxel& v = *vp;
+        if (v.keep) {
+            ++cluster_n;
+            continue;
+        }
         const float span = v.zmax - v.zmin;
         if (span >= v.thr_z) {
             ++thick_n;
@@ -772,8 +871,8 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         }
     }
 
-    PT_INFO("坏体素判定: 总格 %zu, 厚留 %zu, 邻域救回 %zu, 坏 %zu",
-            grid_.size(), thick_n, rescued_n, bad.size());
+    PT_INFO("坏体素判定: 总格 %zu, 团保护 %zu, 厚留 %zu, 邻域救回 %zu, 坏 %zu",
+            grid_.size(), cluster_n, thick_n, rescued_n, bad.size());
     if (have_sample) {
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }

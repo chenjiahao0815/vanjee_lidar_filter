@@ -42,7 +42,9 @@ install(TARGETS
 install(DIRECTORY
   config
   launch
+  scripts
   DESTINATION share/${PROJECT_NAME}
+  USE_SOURCE_PERMISSIONS
 )
 
 if(BUILD_TESTING)

@@ -111,6 +111,7 @@ private:
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
+    void markMultiRingClusters(std::vector<Voxel*>& all);
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
@@ -120,6 +121,7 @@ private:
     int ringId(float x, float y, float z) const;
     void addRing(Voxel& v, float x, float y, float z) const;
     bool hasNeighborSupport(const Voxel& v, const std::vector<Voxel*>& all) const;
+    static int ringBitCount(uint64_t mask);
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
@@ -158,6 +160,7 @@ private:
     double max_xy_{0.5};
     double max_z_{0.5};
     double thr_ratio_{0.5};
+    double cluster_link_m_{0.12};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;
