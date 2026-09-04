@@ -19,15 +19,15 @@ Visualization Manager:
       Decay Time: 0
       Enabled: true
       Name: RawLidar
-      Size (m): 0.03
-      Style: Squares
+      Size (m): 0.04
+      Style: Cubes
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/lidar
-      Use Fixed Frame: false
+      Use Fixed Frame: true
       Value: true
     - Alpha: 1
       Class: rviz_default_plugins/PointCloud2
@@ -35,15 +35,15 @@ Visualization Manager:
       Decay Time: 0
       Enabled: true
       Name: FilterVerdict
-      Size (m): 0.05
-      Style: Squares
+      Size (m): 0.04
+      Style: Cubes
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/filter_verdict
-      Use Fixed Frame: false
+      Use Fixed Frame: true
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
@@ -52,7 +52,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/filter_boxes
       Value: true
     - Class: rviz_default_plugins/MarkerArray
@@ -62,7 +62,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/voxel_markers
       Value: true
     - Alpha: 1
@@ -78,7 +78,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/lidar_passthrough
       Use Fixed Frame: true
       Value: false
@@ -95,7 +95,7 @@ Visualization Manager:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Best Effort
+        Reliability Policy: Reliable
         Value: /vanjee/lidar_removed
       Use Fixed Frame: true
       Value: false

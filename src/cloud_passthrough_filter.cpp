@@ -73,25 +73,26 @@ CloudPassthroughFilterNode::CloudPassthroughFilterNode()
             static_cast<size_t>(memory_pool_size_),
             static_cast<size_t>(memory_pool_reserve_));
 
+        // 雷达 /vanjee/lidar 是 Reliable；本节点订阅和所有发布都用 Reliable，才能和 RViz 配对
+        const auto qos = rclcpp::QoS{5}.reliable();
         subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        input_topic_, rclcpp::QoS{5}.best_effort(),
+            input_topic_, qos,
             std::bind(&CloudPassthroughFilterNode::cloud_callback, this, std::placeholders::_1));
         publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        output_topic_, rclcpp::QoS{5}.best_effort());
+            output_topic_, qos);
 
         if (debug_mode_) {
             axes_[0].debug_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                debug_topic_x_, rclcpp::QoS{5}.best_effort());
+                debug_topic_x_, qos);
             axes_[1].debug_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                debug_topic_y_, rclcpp::QoS{5}.best_effort());
+                debug_topic_y_, qos);
             axes_[2].debug_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                debug_topic_z_, rclcpp::QoS{5}.best_effort());
+                debug_topic_z_, qos);
         if (!removed_topic_.empty()) {
             removed_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                removed_topic_, rclcpp::QoS{5}.best_effort());
+                removed_topic_, qos);
         }
-        // 和雷达点云、本包 RViz 配置一致，用 Best Effort；和 Reliable 订户互不兼容
-        const auto viz_qos = rclcpp::QoS{5}.best_effort();
+        const auto viz_qos = qos;
         if (!verdict_topic_.empty()) {
             verdict_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
                 verdict_topic_, viz_qos);
@@ -507,7 +508,7 @@ void CloudPassthroughFilterNode::cloud_callback(
                 bad_voxels.size(), n_before_voxel, current->size());
     } else if (debug_mode_) {
         publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
-    }
+        }
 
         publish_cloud(current, msg->header, publisher_, "最终输出");
     if (raw_viz) {
@@ -832,6 +833,8 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     for (Voxel* v : all) {
         if (v) {
             v->keep = false;
+            v->cluster_id = 0;
+            v->cluster_rings = 0;
         }
     }
     if (n == 0) {
@@ -890,9 +893,23 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     }
 
     std::vector<uint64_t> root_mask(n, 0ull);
+    std::vector<int> root_size(n, 0);
     for (size_t i = 0; i < n; ++i) {
         const int r = find(static_cast<int>(i));
         root_mask[static_cast<size_t>(r)] |= all[i]->ring_mask;
+        ++root_size[static_cast<size_t>(r)];
+    }
+
+    // 根 -> 团号 1,2,3...；至少两格才算团
+    std::vector<int> root_to_id(n, 0);
+    int next_id = 1;
+    for (size_t i = 0; i < n; ++i) {
+        if (find(static_cast<int>(i)) != static_cast<int>(i)) {
+            continue;
+        }
+        if (root_size[i] >= 2) {
+            root_to_id[i] = next_id++;
+        }
     }
 
     size_t multi_n = 0;
@@ -908,14 +925,16 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     }
     for (size_t i = 0; i < n; ++i) {
         const int r = find(static_cast<int>(i));
-        if (ringBitCount(root_mask[static_cast<size_t>(r)]) >= min_cluster_rings_) {
+        all[i]->cluster_id = root_to_id[static_cast<size_t>(r)];
+        all[i]->cluster_rings = ringBitCount(root_mask[static_cast<size_t>(r)]);
+        if (all[i]->cluster_rings >= min_cluster_rings_) {
             all[i]->keep = true;
             ++protect_voxels;
             protect_pts += all[i]->count;
         }
     }
-    PT_INFO("连通团保护: 多线团 %zu, 保护 %zu 格 / %zu 点 (最少 %d 根线, link=%.2f k3d=%.1f k_xy=%.1f)",
-            multi_n, protect_voxels, protect_pts, min_cluster_rings_,
+    PT_INFO("连通团保护: 多线团 %zu, 编号团 %d, 保护 %zu 格 / %zu 点 (最少 %d 根线, link=%.2f k3d=%.1f k_xy=%.1f)",
+            multi_n, next_id - 1, protect_voxels, protect_pts, min_cluster_rings_,
             cluster_link_m_, cluster_link_k_, cluster_plane_k_);
 }
 
@@ -1263,7 +1282,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         boxes_publisher_->publish(arr);
     }
 
-    // 3) 有点的合成体素线框：绿=留下，红=要删
+    // 3) 有点的合成体素：半透明立方体；格顶一条字
     if (voxels_publisher_ && publish_occupied_voxels_) {
         visualization_msgs::msg::MarkerArray arr;
         visualization_msgs::msg::Marker clear;
@@ -1273,55 +1292,71 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         clear.action = visualization_msgs::msg::Marker::DELETEALL;
         arr.markers.push_back(clear);
 
-        visualization_msgs::msg::Marker kept;
-        kept.header = header;
-        kept.ns = "occupied_voxels";
-        kept.id = 1;
-        kept.type = visualization_msgs::msg::Marker::LINE_LIST;
-        kept.action = visualization_msgs::msg::Marker::ADD;
-        kept.pose.orientation.w = 1.0;
-        kept.scale.x = 0.008;
-        kept.color.r = 0.15f;
-        kept.color.g = 0.85f;
-        kept.color.b = 0.2f;
-        kept.color.a = 0.45f;
-
-        visualization_msgs::msg::Marker bad;
-        bad.header = header;
-        bad.ns = "occupied_voxels";
-        bad.id = 2;
-        bad.type = visualization_msgs::msg::Marker::LINE_LIST;
-        bad.action = visualization_msgs::msg::Marker::ADD;
-        bad.pose.orientation.w = 1.0;
-        bad.scale.x = 0.012;
-        bad.color.r = 0.95f;
-        bad.color.g = 0.15f;
-        bad.color.b = 0.15f;
-        bad.color.a = 0.9f;
-
         constexpr size_t kMaxVoxels = 2500;
         size_t drawn = 0;
+        int cube_id = 2;
+        int text_id = 10000;
         for (const auto& entry : grid_) {
             if (drawn >= kMaxVoxels) {
                 break;
             }
             const Voxel& v = entry.second;
-            const double hx = 0.5 * std::max(static_cast<double>(v.size_xy), base_xy_);
-            const double hy = hx;
-            // 高度用合成格边长，至少盖住点的 z 跨度，避免薄到看不见
-            const double hz = 0.5 * std::max(
-                static_cast<double>(v.size_z),
-                std::max(static_cast<double>(v.zmax - v.zmin), base_z_));
-            const double cx = static_cast<double>(v.cx);
-            const double cy = static_cast<double>(v.cy);
-            const double cz = 0.5 * (static_cast<double>(v.zmin) + static_cast<double>(v.zmax));
-            visualization_msgs::msg::Marker& dst =
-                (bad_set.count(&v) != 0) ? bad : kept;
-            appendBoxEdges(dst, cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz);
+            const double sx = std::max(static_cast<double>(v.size_xy), base_xy_);
+            const double sz = std::max(static_cast<double>(v.size_z), base_z_);
+            const double xmin = static_cast<double>(v.ix) * sx;
+            const double ymin = static_cast<double>(v.iy) * sx;
+            const double zmin = static_cast<double>(v.iz) * sz;
+
+            const double cx = xmin + 0.5 * sx;
+            const double cy = ymin + 0.5 * sx;
+            const double cz = zmin + 0.5 * sz;
+
+            visualization_msgs::msg::Marker cube;
+            cube.header = header;
+            cube.ns = "occupied_voxels";
+            cube.id = cube_id++;
+            cube.type = visualization_msgs::msg::Marker::CUBE;
+            cube.action = visualization_msgs::msg::Marker::ADD;
+            cube.pose.orientation.w = 1.0;
+            cube.pose.position.x = cx;
+            cube.pose.position.y = cy;
+            cube.pose.position.z = cz;
+            cube.scale.x = sx;
+            cube.scale.y = sx;
+            cube.scale.z = sz;
+            cube.color.r = 1.0f;
+            cube.color.g = 1.0f;
+            cube.color.b = 0.75f;
+            cube.color.a = 0.22f;
+            arr.markers.push_back(cube);
+
+            visualization_msgs::msg::Marker text;
+            text.header = header;
+            text.ns = "occupied_voxels";
+            text.id = text_id++;
+            text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            text.action = visualization_msgs::msg::Marker::ADD;
+            text.pose.orientation.w = 1.0;
+            text.pose.position.x = cx;
+            text.pose.position.y = cy;
+            text.pose.position.z = zmin + sz + 0.03;
+            text.scale.z = 0.027;
+            text.color.r = 1.0f;
+            text.color.g = 1.0f;
+            text.color.b = 0.85f;
+            text.color.a = 1.0f;
+            char buf[80];
+            const int rings = std::max(v.cluster_rings, 0);
+            if (v.cluster_id > 0) {
+                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%d,n%d",
+                              cx, cy, cz, v.cluster_id, rings);
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,n%d", cx, cy, cz, rings);
+            }
+            text.text = buf;
+            arr.markers.push_back(text);
             ++drawn;
         }
-        arr.markers.push_back(kept);
-        arr.markers.push_back(bad);
         voxels_publisher_->publish(arr);
         PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝(立方体无直通) %zu 有点体素 %zu/%zu",
                 n_del, n_keep, n_blue, drawn, grid_.size());

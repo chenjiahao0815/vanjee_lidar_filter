@@ -71,6 +71,8 @@ struct Voxel {
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
     bool keep{true};
+    int cluster_id{0};     // 连通团编号，0=未成团/单格
+    int cluster_rings{0};  // 进团=整团线数；单格=自己的线数
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
