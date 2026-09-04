@@ -26,7 +26,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2
 
 ANG_V = 0.0174532925
-LIM = dict(x=(0.0, 3.5), y=(-2.0, 2.0), z=(-0.2, 0.4))
+LIM = dict(x=(-2.0, 2.0), y=(-2.0, 2.0), z=(-1.0, 1.0))
 CUBE = (2.0, 2.0, 1.0)  # half L/W/H of 4x4x2
 CLUSTER_G = 0.12
 

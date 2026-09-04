@@ -18,12 +18,12 @@ cloud_passthrough_filter_node:
     # limit_min_z: -0.2
     # limit_max_z: 0.4
     # 与立方体 4×4×2（|x|≤2, |y|≤2, |z|≤1）对齐
-    limit_min_x: -2.0
-    limit_max_x: 2.0
-    limit_min_y: -2.0
-    limit_max_y: 2.0
-    limit_min_z: -1.0
-    limit_max_z: 1.0
+    limit_min_x: -8.0
+    limit_max_x: 8.0
+    limit_min_y: -8.0
+    limit_max_y: 8.0
+    limit_min_z: -2.0
+    limit_max_z: 2.0
 
     debug_mode: true
     debug_topic_x: "/vanjee/passthrough_x"
@@ -45,8 +45,8 @@ cloud_passthrough_filter_node:
     ang_h: 0.0034906585
     ang_v: 0.0174532925
     r_max: 8.0
-    base_xy: 0.01
-    base_z: 0.01
+    base_xy: 0.1
+    base_z: 0.1
     max_xy: 0.5
     max_z: 0.5
     thr_ratio: 0.5
@@ -55,7 +55,8 @@ cloud_passthrough_filter_node:
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
 
-    # 实时可视化（debug_mode=true 时发布）
+    min_cluster_rings: 2
+
     # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"
     boxes_topic: "/vanjee/filter_boxes"

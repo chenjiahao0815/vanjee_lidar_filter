@@ -177,6 +177,7 @@ private:
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
+    int min_cluster_rings_{2};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;
