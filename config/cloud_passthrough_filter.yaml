@@ -10,13 +10,20 @@ cloud_passthrough_filter_node:
     enable_y: true
     enable_z: true
 
-    # 默认按 front_ground_segmentation 的直通区间，现场再改
-    limit_min_x: 0.0
-    limit_max_x: 3.5
+    # 原先按 front_ground_segmentation 的前方直通，和雷达中心立方体对不齐
+    # limit_min_x: 0.0
+    # limit_max_x: 3.5
+    # limit_min_y: -2.0
+    # limit_max_y: 2.0
+    # limit_min_z: -0.2
+    # limit_max_z: 0.4
+    # 与立方体 4×4×2（|x|≤2, |y|≤2, |z|≤1）对齐
+    limit_min_x: -2.0
+    limit_max_x: 2.0
     limit_min_y: -2.0
     limit_max_y: 2.0
-    limit_min_z: -0.2
-    limit_max_z: 0.4
+    limit_min_z: -1.0
+    limit_max_z: 1.0
 
     debug_mode: true
     debug_topic_x: "/vanjee/passthrough_x"
@@ -47,3 +54,10 @@ cloud_passthrough_filter_node:
     cluster_link_m: 0.18
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
+
+    # 实时可视化（debug_mode=true 时发布）
+    # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
+    verdict_topic: "/vanjee/filter_verdict"
+    boxes_topic: "/vanjee/filter_boxes"
+    voxels_topic: "/vanjee/voxel_markers"
+    publish_occupied_voxels: true

@@ -9,6 +9,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common)
 
@@ -30,6 +32,8 @@ ament_target_dependencies(cloud_passthrough_filter_node
   rclcpp
   sensor_msgs
   std_msgs
+  visualization_msgs
+  geometry_msgs
   pcl_conversions
 )
 target_link_libraries(cloud_passthrough_filter_node ${PCL_LIBRARIES})
@@ -43,6 +47,7 @@ install(DIRECTORY
   config
   launch
   scripts
+  rviz
   DESTINATION share/${PROJECT_NAME}
   USE_SOURCE_PERMISSIONS
 )

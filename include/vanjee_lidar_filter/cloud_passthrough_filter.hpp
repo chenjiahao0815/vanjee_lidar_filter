@@ -4,6 +4,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -107,6 +108,7 @@ private:
     void logVoxelScaleSamples() const;
     VoxelScale computeVoxelScale(double r) const;
     bool inOurCube(float x, float y, float z) const;
+    bool inPassthrough(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
@@ -114,6 +116,11 @@ private:
     void markMultiRingClusters(std::vector<Voxel*>& all);
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<Voxel*>& bad_voxels,
+        const std_msgs::msg::Header& header);
+    void publishFilterDebug(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& raw_cloud,
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
         const std::vector<Voxel*>& bad_voxels,
         const std_msgs::msg::Header& header);
     int64_t makeKey(int ix, int iy, int iz) const;
@@ -126,6 +133,9 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr removed_publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr verdict_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr boxes_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxels_publisher_;
     std::unique_ptr<PointCloudMemoryPool> memory_pool_;
 
     std::array<AxisSpec, 3> axes_{};
@@ -137,6 +147,10 @@ private:
     std::string debug_topic_x_;
     std::string debug_topic_y_;
     std::string debug_topic_z_;
+    std::string verdict_topic_;
+    std::string boxes_topic_;
+    std::string voxels_topic_;
+    bool publish_occupied_voxels_{true};
 
     int memory_pool_size_{10};
     int memory_pool_reserve_{1000000};

@@ -1,12 +1,16 @@
 #include "vanjee_lidar_filter/cloud_passthrough_filter.hpp"
 
 #include <pcl_conversions/pcl_conversions.h>
+#include <geometry_msgs/msg/point.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #define PT_INFO(...) \
@@ -70,10 +74,10 @@ CloudPassthroughFilterNode::CloudPassthroughFilterNode()
         static_cast<size_t>(memory_pool_reserve_));
 
     subscription_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        input_topic_, rclcpp::QoS{1}.best_effort(),
+        input_topic_, rclcpp::QoS{5}.best_effort(),
         std::bind(&CloudPassthroughFilterNode::cloud_callback, this, std::placeholders::_1));
     publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        output_topic_, rclcpp::QoS{1}.best_effort());
+        output_topic_, rclcpp::QoS{5}.best_effort());
 
     if (debug_mode_) {
         axes_[0].debug_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -85,6 +89,20 @@ CloudPassthroughFilterNode::CloudPassthroughFilterNode()
         if (!removed_topic_.empty()) {
             removed_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
                 removed_topic_, rclcpp::QoS{5}.best_effort());
+        }
+        // 和雷达点云、本包 RViz 配置一致，用 Best Effort；和 Reliable 订户互不兼容
+        const auto viz_qos = rclcpp::QoS{5}.best_effort();
+        if (!verdict_topic_.empty()) {
+            verdict_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                verdict_topic_, viz_qos);
+        }
+        if (!boxes_topic_.empty()) {
+            boxes_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                boxes_topic_, viz_qos);
+        }
+        if (publish_occupied_voxels_ && !voxels_topic_.empty()) {
+            voxels_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                voxels_topic_, viz_qos);
         }
     }
 
@@ -102,12 +120,12 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("enable_x", true);
     this->declare_parameter("enable_y", true);
     this->declare_parameter("enable_z", true);
-    this->declare_parameter("limit_min_x", 0.0);
-    this->declare_parameter("limit_max_x", 3.5);
+    this->declare_parameter("limit_min_x", -2.0);
+    this->declare_parameter("limit_max_x", 2.0);
     this->declare_parameter("limit_min_y", -2.0);
     this->declare_parameter("limit_max_y", 2.0);
-    this->declare_parameter("limit_min_z", -0.2);
-    this->declare_parameter("limit_max_z", 0.4);
+    this->declare_parameter("limit_min_z", -1.0);
+    this->declare_parameter("limit_max_z", 1.0);
     this->declare_parameter("debug_mode", true);
     this->declare_parameter("debug_topic_x", std::string("passthrough_cloud_x"));
     this->declare_parameter("debug_topic_y", std::string("passthrough_cloud_y"));
@@ -131,6 +149,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_link_m", 0.18);
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
+    this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
+    this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
+    this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
+    this->declare_parameter("publish_occupied_voxels", true);
 
     input_topic_ = this->get_parameter("input_topic").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
@@ -177,6 +199,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (cluster_plane_k_ <= 0.0) {
         cluster_plane_k_ = 10.0;
     }
+    verdict_topic_ = this->get_parameter("verdict_topic").as_string();
+    boxes_topic_ = this->get_parameter("boxes_topic").as_string();
+    voxels_topic_ = this->get_parameter("voxels_topic").as_string();
+    publish_occupied_voxels_ = this->get_parameter("publish_occupied_voxels").as_bool();
 
     axes_[0].name = 'x';
     axes_[0].dim = 0;
@@ -276,6 +302,11 @@ void CloudPassthroughFilterNode::log_startup() const
         RCLCPP_INFO(this->get_logger(), "  Y debug 话题: %s", debug_topic_y_.c_str());
         RCLCPP_INFO(this->get_logger(), "  Z debug 话题: %s", debug_topic_z_.c_str());
         RCLCPP_INFO(this->get_logger(), "  被删点话题: %s", removed_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  判定配色: %s", verdict_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  范围线框: %s", boxes_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  有点体素: %s (%s)",
+                    voxels_topic_.c_str(),
+                    publish_occupied_voxels_ ? "开" : "关");
     }
     RCLCPP_INFO(this->get_logger(),
                 "  帧日志间隔: %.2f s (仅 debug_mode=false 时限频)",
@@ -411,6 +442,12 @@ void CloudPassthroughFilterNode::cloud_callback(
     const size_t n_in = current->size();
     PT_INFO("输入 %zu 点 (原始 %zu)，order=%s", n_in, n_raw, order_string().c_str());
 
+    pcl::PointCloud<pcl::PointXYZ>::Ptr raw_viz;
+    if (debug_mode_) {
+        raw_viz = memory_pool_->acquire();
+        *raw_viz = *current;
+    }
+
     for (int dim : filter_order_) {
         AxisSpec& axis = axes_[static_cast<size_t>(dim)];
         if (!axis.enabled) {
@@ -449,18 +486,27 @@ void CloudPassthroughFilterNode::cloud_callback(
 
     // 直通滤波到这里结束，current 是直通后的点云
 
+    std::vector<Voxel*> bad_voxels;
     if (enable_voxel_filter_ && current && !current->empty()) {
         grid_.clear();
         fine_grid_.clear();
         buildVoxelGrid(current);
         const size_t n_before_voxel = current->size();
-        std::vector<Voxel*> bad_voxels = collectBadVoxels();
+        bad_voxels = collectBadVoxels();
+        if (debug_mode_) {
+            publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
+        }
         removePointsInBadVoxels(current, bad_voxels, msg->header);
         PT_INFO("体素删点结束: 坏格 %zu, 点数 %zu → %zu",
                 bad_voxels.size(), n_before_voxel, current->size());
+    } else if (debug_mode_) {
+        publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
     }
 
     publish_cloud(current, msg->header, publisher_, "最终输出");
+    if (raw_viz) {
+        memory_pool_->release(raw_viz);
+    }
     memory_pool_->release(current);
 
     const auto t1 = std::chrono::high_resolution_clock::now();
@@ -485,15 +531,15 @@ void CloudPassthroughFilterNode::logVoxelScaleSamples() const
 
 VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
 {
-    VoxelScale s;
+    VoxelScale s;  //输入和基础值保护      根据点云距离雷达的远近来决定用多大的体素来装点云
     const double rr = std::max(r, 1e-3);
     const double base_xy = std::max(base_xy_, 1e-6);
     const double base_z = std::max(base_z_, 1e-6);
 
-    // 线间距随距离变大。横向跟这条线间距走，纵向盖住两条线
+    // 用这个间距来决定格子应该多大
     s.line_gap = rr * ang_v_;
     s.pt_gap = s.line_gap;
-    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);
+    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);  
     s.size_z = std::min(std::max(2.0 * s.line_gap, base_z), max_z_);
     s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy)));
     s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z)));
@@ -519,6 +565,16 @@ bool CloudPassthroughFilterNode::inOurCube(float x, float y, float z) const
     return std::fabs(static_cast<double>(x)) <= half_l &&
            std::fabs(static_cast<double>(y)) <= half_w &&
            std::fabs(static_cast<double>(z)) <= half_h;
+}
+
+bool CloudPassthroughFilterNode::inPassthrough(float x, float y, float z) const
+{
+    return static_cast<double>(x) >= axes_[0].limit_min &&
+           static_cast<double>(x) <= axes_[0].limit_max &&
+           static_cast<double>(y) >= axes_[1].limit_min &&
+           static_cast<double>(y) <= axes_[1].limit_max &&
+           static_cast<double>(z) >= axes_[2].limit_min &&
+           static_cast<double>(z) <= axes_[2].limit_max;
 }
 
 void CloudPassthroughFilterNode::buildVoxelGrid(
@@ -969,6 +1025,300 @@ void CloudPassthroughFilterNode::removePointsInBadVoxels(
         removed->width = static_cast<uint32_t>(removed->points.size());
         publish_cloud(removed, header, removed_publisher_, "被删点");
         memory_pool_->release(removed);
+    }
+}
+
+namespace {
+
+uint32_t packRgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (static_cast<uint32_t>(r) << 16) |
+           (static_cast<uint32_t>(g) << 8) |
+           static_cast<uint32_t>(b);
+}
+
+void appendBoxEdges(
+    visualization_msgs::msg::Marker& m,
+    double xmin, double xmax,
+    double ymin, double ymax,
+    double zmin, double zmax)
+{
+    const double xs[2] = {xmin, xmax};
+    const double ys[2] = {ymin, ymax};
+    const double zs[2] = {zmin, zmax};
+    const int corners[8][3] = {
+        {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
+        {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1},
+    };
+    const int edges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},
+    };
+    for (const auto& e : edges) {
+        for (int k = 0; k < 2; ++k) {
+            const int c = e[k];
+            geometry_msgs::msg::Point p;
+            p.x = xs[corners[c][0]];
+            p.y = ys[corners[c][1]];
+            p.z = zs[corners[c][2]];
+            m.points.push_back(p);
+        }
+    }
+}
+
+}  // namespace
+
+void CloudPassthroughFilterNode::publishFilterDebug(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& raw_cloud,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
+    const std::vector<Voxel*>& bad_voxels,
+    const std_msgs::msg::Header& header)
+{
+    std::unordered_set<const Voxel*> bad_set;
+    bad_set.reserve(bad_voxels.size() * 2 + 1);
+    for (const Voxel* v : bad_voxels) {
+        if (v) {
+            bad_set.insert(v);
+        }
+    }
+
+    const uint32_t n_pass = (pass_cloud && !pass_cloud->empty())
+        ? static_cast<uint32_t>(pass_cloud->points.size()) : 0;
+    std::unordered_set<uint64_t> deleted_keys;
+    deleted_keys.reserve(256);
+    auto pack_key = [](float x, float y, float z) -> uint64_t {
+        const int64_t ix = static_cast<int64_t>(std::llround(static_cast<double>(x) * 1000.0));
+        const int64_t iy = static_cast<int64_t>(std::llround(static_cast<double>(y) * 1000.0));
+        const int64_t iz = static_cast<int64_t>(std::llround(static_cast<double>(z) * 1000.0));
+        return (static_cast<uint64_t>(ix + 200000) << 42) |
+               (static_cast<uint64_t>(iy + 200000) << 21) |
+               static_cast<uint64_t>(iz + 200000);
+    };
+    if (n_pass > 0) {
+        std::vector<char> drop(n_pass, 0);
+        for (const Voxel* v : bad_voxels) {
+            if (!v) {
+                continue;
+            }
+            for (uint32_t idx : v->idx) {
+                if (idx < n_pass) {
+                    drop[idx] = 1;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < n_pass; ++i) {
+            if (drop[i] != 0) {
+                const auto& p = pass_cloud->points[i];
+                deleted_keys.insert(pack_key(p.x, p.y, p.z));
+            }
+        }
+    }
+
+    // 1) 三种颜色：红=删，绿=留下，蓝=立方体内但没进直通
+    size_t n_del = 0;
+    size_t n_keep = 0;
+    size_t n_blue = 0;
+    if (verdict_publisher_ && raw_cloud && !raw_cloud->empty()) {
+        const uint32_t n_raw = static_cast<uint32_t>(raw_cloud->points.size());
+        std::vector<uint32_t> pick;
+        std::vector<uint32_t> color;
+        pick.reserve(n_raw);
+        color.reserve(n_raw);
+        const uint32_t c_del = packRgb(240, 40, 40);
+        const uint32_t c_keep = packRgb(40, 220, 80);
+        const uint32_t c_blue = packRgb(40, 110, 255);
+
+        for (uint32_t i = 0; i < n_raw; ++i) {
+            const auto& p = raw_cloud->points[i];
+            const bool cube = inOurCube(p.x, p.y, p.z);
+            const bool pass = inPassthrough(p.x, p.y, p.z);
+            if (cube && !pass) {
+                pick.push_back(i);
+                color.push_back(c_blue);
+                ++n_blue;
+            } else if (cube && pass) {
+                if (deleted_keys.count(pack_key(p.x, p.y, p.z)) != 0) {
+                    pick.push_back(i);
+                    color.push_back(c_del);
+                    ++n_del;
+                } else {
+                    pick.push_back(i);
+                    color.push_back(c_keep);
+                    ++n_keep;
+                }
+            }
+        }
+
+        const uint32_t n_out = static_cast<uint32_t>(pick.size());
+        sensor_msgs::msg::PointCloud2 msg;
+        msg.header = header;
+        msg.height = 1;
+        msg.width = n_out;
+        msg.is_bigendian = false;
+        msg.is_dense = true;
+        msg.fields.resize(4);
+        msg.fields[0].name = "x";
+        msg.fields[0].offset = 0;
+        msg.fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        msg.fields[0].count = 1;
+        msg.fields[1].name = "y";
+        msg.fields[1].offset = 4;
+        msg.fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        msg.fields[1].count = 1;
+        msg.fields[2].name = "z";
+        msg.fields[2].offset = 8;
+        msg.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        msg.fields[2].count = 1;
+        msg.fields[3].name = "rgb";
+        msg.fields[3].offset = 12;
+        msg.fields[3].datatype = sensor_msgs::msg::PointField::FLOAT32;
+        msg.fields[3].count = 1;
+        msg.point_step = 16;
+        msg.row_step = msg.point_step * n_out;
+        msg.data.resize(static_cast<size_t>(msg.row_step));
+        for (uint32_t k = 0; k < n_out; ++k) {
+            const auto& p = raw_cloud->points[pick[k]];
+            uint8_t* dst = msg.data.data() + static_cast<size_t>(k) * msg.point_step;
+            float xyz[3] = {p.x, p.y, p.z};
+            std::memcpy(dst, xyz, 12);
+            std::memcpy(dst + 12, &color[k], 4);
+        }
+        verdict_publisher_->publish(msg);
+    }
+
+    // 2) 范围线框：青=立方体，橙=直通；头顶一行统计
+    if (boxes_publisher_) {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker clear;
+        clear.header = header;
+        clear.ns = "filter_boxes";
+        clear.id = 0;
+        clear.action = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(clear);
+
+        visualization_msgs::msg::Marker cube;
+        cube.header = header;
+        cube.ns = "filter_boxes";
+        cube.id = 1;
+        cube.type = visualization_msgs::msg::Marker::LINE_LIST;
+        cube.action = visualization_msgs::msg::Marker::ADD;
+        cube.pose.orientation.w = 1.0;
+        cube.scale.x = 0.02;
+        cube.color.r = 0.0f;
+        cube.color.g = 0.85f;
+        cube.color.b = 0.85f;
+        cube.color.a = 0.95f;
+        appendBoxEdges(cube,
+                       -0.5 * cube_length_, 0.5 * cube_length_,
+                       -0.5 * cube_width_, 0.5 * cube_width_,
+                       -0.5 * cube_height_, 0.5 * cube_height_);
+        arr.markers.push_back(cube);
+
+        visualization_msgs::msg::Marker pass;
+        pass.header = header;
+        pass.ns = "filter_boxes";
+        pass.id = 2;
+        pass.type = visualization_msgs::msg::Marker::LINE_LIST;
+        pass.action = visualization_msgs::msg::Marker::ADD;
+        pass.pose.orientation.w = 1.0;
+        pass.scale.x = 0.015;
+        pass.color.r = 1.0f;
+        pass.color.g = 0.55f;
+        pass.color.b = 0.0f;
+        pass.color.a = 0.9f;
+        appendBoxEdges(pass,
+                       axes_[0].limit_min, axes_[0].limit_max,
+                       axes_[1].limit_min, axes_[1].limit_max,
+                       axes_[2].limit_min, axes_[2].limit_max);
+        arr.markers.push_back(pass);
+
+        visualization_msgs::msg::Marker text;
+        text.header = header;
+        text.ns = "filter_boxes";
+        text.id = 3;
+        text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        text.action = visualization_msgs::msg::Marker::ADD;
+        text.pose.orientation.w = 1.0;
+        text.pose.position.x = 0.0;
+        text.pose.position.y = 0.0;
+        text.pose.position.z = 0.5 * cube_height_ + 0.35;
+        text.scale.z = 0.12;
+        text.color.r = 1.0f;
+        text.color.g = 1.0f;
+        text.color.b = 1.0f;
+        text.color.a = 1.0f;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "del(红)=%zu  keep(绿)=%zu  cube-only(蓝)=%zu  voxels=%zu",
+                      n_del, n_keep, n_blue, grid_.size());
+        text.text = buf;
+        arr.markers.push_back(text);
+        boxes_publisher_->publish(arr);
+    }
+
+    // 3) 有点的合成体素线框：绿=留下，红=要删
+    if (voxels_publisher_ && publish_occupied_voxels_) {
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker clear;
+        clear.header = header;
+        clear.ns = "occupied_voxels";
+        clear.id = 0;
+        clear.action = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(clear);
+
+        visualization_msgs::msg::Marker kept;
+        kept.header = header;
+        kept.ns = "occupied_voxels";
+        kept.id = 1;
+        kept.type = visualization_msgs::msg::Marker::LINE_LIST;
+        kept.action = visualization_msgs::msg::Marker::ADD;
+        kept.pose.orientation.w = 1.0;
+        kept.scale.x = 0.008;
+        kept.color.r = 0.15f;
+        kept.color.g = 0.85f;
+        kept.color.b = 0.2f;
+        kept.color.a = 0.45f;
+
+        visualization_msgs::msg::Marker bad;
+        bad.header = header;
+        bad.ns = "occupied_voxels";
+        bad.id = 2;
+        bad.type = visualization_msgs::msg::Marker::LINE_LIST;
+        bad.action = visualization_msgs::msg::Marker::ADD;
+        bad.pose.orientation.w = 1.0;
+        bad.scale.x = 0.012;
+        bad.color.r = 0.95f;
+        bad.color.g = 0.15f;
+        bad.color.b = 0.15f;
+        bad.color.a = 0.9f;
+
+        constexpr size_t kMaxVoxels = 2500;
+        size_t drawn = 0;
+        for (const auto& entry : grid_) {
+            if (drawn >= kMaxVoxels) {
+                break;
+            }
+            const Voxel& v = entry.second;
+            const double hx = 0.5 * std::max(static_cast<double>(v.size_xy), base_xy_);
+            const double hy = hx;
+            // 高度用合成格边长，至少盖住点的 z 跨度，避免薄到看不见
+            const double hz = 0.5 * std::max(
+                static_cast<double>(v.size_z),
+                std::max(static_cast<double>(v.zmax - v.zmin), base_z_));
+            const double cx = static_cast<double>(v.cx);
+            const double cy = static_cast<double>(v.cy);
+            const double cz = 0.5 * (static_cast<double>(v.zmin) + static_cast<double>(v.zmax));
+            visualization_msgs::msg::Marker& dst =
+                (bad_set.count(&v) != 0) ? bad : kept;
+            appendBoxEdges(dst, cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz);
+            ++drawn;
+        }
+        arr.markers.push_back(kept);
+        arr.markers.push_back(bad);
+        voxels_publisher_->publish(arr);
+        PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝(立方体无直通) %zu 有点体素 %zu/%zu",
+                n_del, n_keep, n_blue, drawn, grid_.size());
     }
 }
 
