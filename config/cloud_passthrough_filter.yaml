@@ -39,7 +39,7 @@ cloud_passthrough_filter_node:
     cube_width: 4.0
     cube_height: 2.0
 
-    # 细格 base；合成后横向=1×线间距，纵向=2×线间距
+    # 细格 base；合成后横向=1×线间距，纵向=size_z_ratio×线间距
     removed_topic: "/vanjee/lidar_removed"
     enable_voxel_filter: true
     ang_h: 0.0034906585
@@ -49,6 +49,10 @@ cloud_passthrough_filter_node:
     base_z: 0.1
     max_xy: 0.5
     max_z: 0.5
+
+    size_z_ratio: 4.0
+    size_z_min: 0.1
+
     thr_ratio: 2.0
     # 近处 thr_z 绝对下限，避免贴雷达时门槛掉到几毫米
     # 和下面的 cluster_min_h 对齐：单格想凭厚度免死，也得有实物那么厚
@@ -58,11 +62,11 @@ cloud_passthrough_filter_node:
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
 
-    # 团保护先看物理高度：整团必须真的立起 cluster_min_h 才算实物，扁的一律毙
-    # 线数门槛不再是定值，按 h/(r·ang_v) 折出来再两端夹住
-    #   r < 2.29 m → 3 根线，r ≥ 2.29 m → 2 根线（启动日志会打这条曲线）
-    # 上限只用来挡一两根线的飞点，压不住扁团，扁不扁交给 cluster_min_h
     cluster_min_h: 0.08
+    # 团点跨度 H 必须 ≥ k × 团内最高格子的 size_z，否则当饼，不保护
+    cluster_aspect_k: 1.5
+    # 编号团里坏格占比 ≥ 此值，整团扫光
+    cluster_wipe_ratio: 0.7
     min_cluster_rings: 2     # 最远处的下限
     max_cluster_rings: 3     # 非常近时的上限
 

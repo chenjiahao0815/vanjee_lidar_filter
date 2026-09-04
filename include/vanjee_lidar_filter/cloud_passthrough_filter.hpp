@@ -135,7 +135,6 @@ private:
     // 优先用 ring_of_cur_[i] 里的真实线号，缺失时退回 atan2 几何估计
     int ringOfPoint(uint32_t i, float x, float y, float z) const;
     void addRing(Voxel& v, uint32_t i, float x, float y, float z) const;
-    bool hasNeighborSupport(const Voxel& v, const std::vector<Voxel*>& all) const;
     static int ringBitCount(uint64_t mask);
     // 要判成实物，这个距离上至少得被多少根线扫到
     int requiredRings(double r) const;
@@ -183,6 +182,9 @@ private:
     double base_z_{0.01};
     double max_xy_{0.5};
     double max_z_{0.5};
+    // 纵向边长 = size_z_ratio × 线间距，再夹在 [size_z_min, max_z]
+    double size_z_ratio_{4.0};
+    double size_z_min_{0.1};
     double thr_ratio_{0.5};
     double thr_z_min_{0.03};
     double cluster_link_m_{0.18};
@@ -191,6 +193,10 @@ private:
     int min_cluster_rings_{2};
     // 线数门槛不再是定值：由“实物最小高度”按 h/(r·ang_v) 折出来，两端夹住
     double cluster_min_h_{0.08};
+    // 团高度至少是团内最高格子 size_z 的这么多倍，才算墙而不是饼
+    double cluster_aspect_k_{2.0};
+    // 编号团里坏格占比 ≥ 此值，整团扫光（别留几颗孤点）
+    double cluster_wipe_ratio_{0.7};
     int max_cluster_rings_{8};
     bool enable_voxel_filter_{true};
 

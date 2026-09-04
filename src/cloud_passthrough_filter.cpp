@@ -147,6 +147,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("base_z", 0.01);
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
+    this->declare_parameter("size_z_ratio", 4.0);
+    this->declare_parameter("size_z_min", 0.1);
     this->declare_parameter("thr_ratio", 0.5);
     this->declare_parameter("thr_z_min", 0.03);
     this->declare_parameter("cluster_link_m", 0.18);
@@ -154,6 +156,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_plane_k", 10.0);
     this->declare_parameter("min_cluster_rings", 2);
     this->declare_parameter("cluster_min_h", 0.08);
+    this->declare_parameter("cluster_aspect_k", 2.0);
+    this->declare_parameter("cluster_wipe_ratio", 0.7);
     this->declare_parameter("max_cluster_rings", 8);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
@@ -192,6 +196,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     base_z_ = this->get_parameter("base_z").as_double();
     max_xy_ = this->get_parameter("max_xy").as_double();
     max_z_ = this->get_parameter("max_z").as_double();
+    size_z_ratio_ = this->get_parameter("size_z_ratio").as_double();
+    if (size_z_ratio_ <= 0.0) {
+        size_z_ratio_ = 4.0;
+    }
+    size_z_min_ = this->get_parameter("size_z_min").as_double();
+    if (size_z_min_ <= 0.0) {
+        size_z_min_ = 0.1;
+    }
     thr_ratio_ = this->get_parameter("thr_ratio").as_double();
     thr_z_min_ = this->get_parameter("thr_z_min").as_double();
     if (thr_z_min_ < 0.0) {
@@ -216,6 +228,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     cluster_min_h_ = this->get_parameter("cluster_min_h").as_double();
     if (cluster_min_h_ <= 0.0) {
         cluster_min_h_ = 0.08;
+    }
+    cluster_aspect_k_ = this->get_parameter("cluster_aspect_k").as_double();
+    if (cluster_aspect_k_ < 1.0) {
+        cluster_aspect_k_ = 2.0;
+    }
+    cluster_wipe_ratio_ = this->get_parameter("cluster_wipe_ratio").as_double();
+    if (cluster_wipe_ratio_ <= 0.0 || cluster_wipe_ratio_ > 1.0) {
+        cluster_wipe_ratio_ = 0.7;
     }
     max_cluster_rings_ = this->get_parameter("max_cluster_rings").as_int();
     if (max_cluster_rings_ < min_cluster_rings_) {
@@ -340,13 +360,16 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f thr_z_min=%.3f, "
+                    "横向=1×线间距 纵向=%.1f×线间距夹[%.3f,%.3f], thr_ratio=%.2f thr_z_min=%.3f, "
                     "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
-                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_, thr_z_min_,
+                    ang_h_, ang_v_, base_xy_, base_z_, size_z_ratio_, size_z_min_, max_z_,
+                    thr_ratio_, thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
-                    "  团保护: 实物最小高度 cluster_min_h=%.3f m, 线数门槛夹在 [%d, %d]",
-                    cluster_min_h_, min_cluster_rings_, max_cluster_rings_);
+                    "  团保护: 实物最小高度 cluster_min_h=%.3f m, "
+                    "团高≥%.1f×团内最大size_z, 坏格≥%.0f%%整团扫, 线数门槛夹在 [%d, %d]",
+                    cluster_min_h_, cluster_aspect_k_, 100.0 * cluster_wipe_ratio_,
+                    min_cluster_rings_, max_cluster_rings_);
         for (double r : {0.3, 0.5, 1.0, 2.0, 2.83}) {
             RCLCPP_INFO(this->get_logger(),
                         "    r=%.2f 线间距=%.4f m → 至少 %d 根线",
@@ -658,8 +681,9 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
     // 用这个间距来决定格子应该多大
     s.line_gap = rr * ang_v_;
     s.pt_gap = s.line_gap;
-    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);  
-    s.size_z = std::min(std::max(2.0 * s.line_gap, base_z), max_z_);
+    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);
+    // 纵向按线间距放大：近处有 size_z_min 托底，远处顶到 max_z
+    s.size_z = std::min(std::max(size_z_ratio_ * s.line_gap, size_z_min_), max_z_);
     s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy)));
     s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z)));
     s.size_xy = std::min(base_xy * static_cast<double>(s.mult_xy), max_xy_);
@@ -917,47 +941,6 @@ int CloudPassthroughFilterNode::requiredRings(double r) const
     return std::min(std::max(n, lo), hi);
 }
 
-bool CloudPassthroughFilterNode::hasNeighborSupport(
-    const Voxel& v, const std::vector<Voxel*>& all) const
-{
-    const float line_gap = std::max(v.r, 1e-3f) * static_cast<float>(ang_v_);
-    const float search_xy = 1.5f * std::max(v.size_xy, line_gap);
-    const float search_z = 2.5f * line_gap;
-    const float search_xy2 = search_xy * search_xy;
-
-    for (const Voxel* other : all) {
-        if (!other || other == &v) {
-            continue;
-        }
-        const float dx = other->cx - v.cx;
-        const float dy = other->cy - v.cy;
-        if (dx * dx + dy * dy > search_xy2) {
-            continue;
-        }
-
-        float gap_z = 0.0f;
-        if (other->zmin > v.zmax) {
-            gap_z = other->zmin - v.zmax;
-        } else if (v.zmin > other->zmax) {
-            gap_z = v.zmin - other->zmax;
-        }
-        if (gap_z > search_z) {
-            continue;
-        }
-
-        if ((other->ring_mask & ~v.ring_mask) == 0ull) {
-            continue;
-        }
-        // 邻格多一根线还不够：两格合起来得真的高过 cluster_min_h，
-        // 否则一片贴地的扁噪点会互相当旁证，一格格全被救回来
-        const float span2 = std::max(v.zmax, other->zmax) - std::min(v.zmin, other->zmin);
-        if (span2 >= static_cast<float>(cluster_min_h_)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 int CloudPassthroughFilterNode::ringBitCount(uint64_t mask)
 {
     int n = 0;
@@ -1038,6 +1021,7 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     std::vector<float> root_rmin(n, 1e9f);
     std::vector<float> root_zmin(n, 1e9f);
     std::vector<float> root_zmax(n, -1e9f);
+    std::vector<float> root_szmax(n, 0.0f);
     for (size_t i = 0; i < n; ++i) {
         const int r = find(static_cast<int>(i));
         const size_t ri = static_cast<size_t>(r);
@@ -1046,6 +1030,7 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
         root_rmin[ri] = std::min(root_rmin[ri], all[i]->r);
         root_zmin[ri] = std::min(root_zmin[ri], all[i]->zmin);
         root_zmax[ri] = std::max(root_zmax[ri], all[i]->zmax);
+        root_szmax[ri] = std::max(root_szmax[ri], all[i]->size_z);
     }
 
     // 线数门槛按团里最近的那格算，最近处最严
@@ -1060,7 +1045,11 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
         const bool rings_ok = ringBitCount(root_mask[i]) >= root_need[i];
         // 线数够只说明被扫到得多；还得真的立起来 cluster_min_h 才算实物
         const bool span_ok = span >= static_cast<float>(cluster_min_h_);
-        root_ok[i] = (rings_ok && span_ok) ? 1 : 0;
+        // 团高还得 ≥ 团内最高格子 size_z 的 k 倍，否则是横着摊的饼
+        const float need_h = static_cast<float>(cluster_aspect_k_) *
+                             std::max(root_szmax[i], 1e-4f);
+        const bool aspect_ok = span >= need_h;
+        root_ok[i] = (rings_ok && span_ok && aspect_ok) ? 1 : 0;
     }
 
     // 根 -> 团号 1,2,3...；至少两格才算团
@@ -1078,18 +1067,26 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     size_t multi_n = 0;
     size_t protect_voxels = 0;
     size_t protect_pts = 0;
-    size_t drop_thin = 0;   // 线数够但太扁
-    size_t drop_rings = 0;  // 这个距离上线数不够
+    size_t drop_thin = 0;     // 线数够但绝对高度不够
+    size_t drop_pancake = 0;  // 线数够、绝对高度够，但相对格子是饼
+    size_t drop_rings = 0;    // 这个距离上线数不够
     for (size_t i = 0; i < n; ++i) {
         if (find(static_cast<int>(i)) != static_cast<int>(i)) {
             continue;
         }
         if (root_ok[i] != 0) {
             ++multi_n;
-        } else if (ringBitCount(root_mask[i]) >= root_need[i]) {
+            continue;
+        }
+        if (ringBitCount(root_mask[i]) < root_need[i]) {
+            ++drop_rings;
+            continue;
+        }
+        const float span = root_zmax[i] - root_zmin[i];
+        if (span < static_cast<float>(cluster_min_h_)) {
             ++drop_thin;
         } else {
-            ++drop_rings;
+            ++drop_pancake;
         }
     }
     for (size_t i = 0; i < n; ++i) {
@@ -1104,10 +1101,12 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
             protect_pts += all[i]->count;
         }
     }
-    PT_INFO("连通团保护: 过关团 %zu, 太扁毙 %zu, 线不够毙 %zu, 编号团 %d, 保护 %zu 格 / %zu 点 "
-            "(线号=%s, min_h=%.3f, 线数 %d~%d, link=%.2f k3d=%.1f k_xy=%.1f)",
-            multi_n, drop_thin, drop_rings, next_id - 1, protect_voxels, protect_pts,
-            have_ring_ ? "真实ring" : "atan2估计", cluster_min_h_,
+    PT_INFO("连通团保护: 过关团 %zu, 太扁毙 %zu, 饼毙 %zu, 线不够毙 %zu, 编号团 %d, "
+            "保护 %zu 格 / %zu 点 (线号=%s, min_h=%.3f, 团高≥%.1f×size_z, 线数 %d~%d, "
+            "link=%.2f k3d=%.1f k_xy=%.1f)",
+            multi_n, drop_thin, drop_pancake, drop_rings, next_id - 1,
+            protect_voxels, protect_pts,
+            have_ring_ ? "真实ring" : "atan2估计", cluster_min_h_, cluster_aspect_k_,
             min_cluster_rings_, max_cluster_rings_,
             cluster_link_m_, cluster_link_k_, cluster_plane_k_);
 }
@@ -1126,7 +1125,6 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 
     size_t cluster_n = 0;
     size_t thick_n = 0;
-    size_t rescued_n = 0;
     float sample_span = 0.0f;
     float sample_thr = 0.0f;
     bool have_sample = false;
@@ -1137,13 +1135,10 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
             ++cluster_n;
             continue;
         }
+        // 没团保护：只看本格厚度，够厚就留，不够就删
         const float span = v.zmax - v.zmin;
         if (span >= v.thr_z) {
             ++thick_n;
-            continue;
-        }
-        if (hasNeighborSupport(v, all)) {
-            ++rescued_n;
             continue;
         }
         bad.push_back(&v);
@@ -1154,8 +1149,59 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         }
     }
 
-    PT_INFO("坏体素判定: 总格 %zu, 团保护 %zu, 厚留 %zu, 邻域救回 %zu, 坏 %zu",
-            grid_.size(), cluster_n, thick_n, rescued_n, bad.size());
+    // 编号团里坏格太多：整团扫光，别留几颗孤点
+    std::unordered_set<const Voxel*> bad_set;
+    bad_set.reserve(bad.size() * 2 + 1);
+    for (const Voxel* v : bad) {
+        bad_set.insert(v);
+    }
+    std::unordered_map<int, std::vector<Voxel*>> by_cid;
+    by_cid.reserve(64);
+    for (Voxel* vp : all) {
+        if (vp && vp->cluster_id > 0) {
+            by_cid[vp->cluster_id].push_back(vp);
+        }
+    }
+    size_t wipe_clusters = 0;
+    size_t wipe_extra = 0;
+    for (auto& entry : by_cid) {
+        const auto& members = entry.second;
+        if (members.empty()) {
+            continue;
+        }
+        size_t n_bad = 0;
+        for (const Voxel* v : members) {
+            if (bad_set.count(v) != 0) {
+                ++n_bad;
+            }
+        }
+        const double ratio = static_cast<double>(n_bad) /
+                             static_cast<double>(members.size());
+        if (ratio + 1e-12 < cluster_wipe_ratio_) {
+            continue;
+        }
+        ++wipe_clusters;
+        for (Voxel* v : members) {
+            if (bad_set.count(v) != 0) {
+                continue;
+            }
+            // 团保护过关的不扫；只清「单格厚留」留下来的碎渣
+            if (v->keep) {
+                continue;
+            }
+            bad.push_back(v);
+            bad_set.insert(v);
+            ++wipe_extra;
+            if (thick_n > 0) {
+                --thick_n;
+            }
+        }
+    }
+
+    PT_INFO("坏体素判定: 总格 %zu, 团保护 %zu, 厚留 %zu, 坏 %zu "
+            "(整团扫 %zu 个编号团, 多删 %zu 格, 门槛=%.0f%%)",
+            grid_.size(), cluster_n, thick_n, bad.size(),
+            wipe_clusters, wipe_extra, 100.0 * cluster_wipe_ratio_);
     if (have_sample) {
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }
