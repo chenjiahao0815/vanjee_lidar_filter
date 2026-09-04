@@ -70,11 +70,7 @@ struct Voxel {
     float size_z{0.0f};
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
-    bool keep{true};
-    int cluster_id{0};     // 连通团编号，0=未成团/单格
-    int cluster_rings{0};  // 进团=整团线数；单格=自己的线数
-    int need_rings{0};     // 本团按最近距离折算出的线数门槛
-    float cluster_span{0.0f};  // 整团的 z 跨度
+    int cluster_id{0};  // 连通团编号，0=未成团/单格；只给整团扫用，不保护
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -119,7 +115,7 @@ private:
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
-    void markMultiRingClusters(std::vector<Voxel*>& all);
+    void assignClusters(std::vector<Voxel*>& all);
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
@@ -135,9 +131,6 @@ private:
     // 优先用 ring_of_cur_[i] 里的真实线号，缺失时退回 atan2 几何估计
     int ringOfPoint(uint32_t i, float x, float y, float z) const;
     void addRing(Voxel& v, uint32_t i, float x, float y, float z) const;
-    static int ringBitCount(uint64_t mask);
-    // 要判成实物，这个距离上至少得被多少根线扫到
-    int requiredRings(double r) const;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
@@ -190,14 +183,8 @@ private:
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
-    int min_cluster_rings_{2};
-    // 线数门槛不再是定值：由“实物最小高度”按 h/(r·ang_v) 折出来，两端夹住
-    double cluster_min_h_{0.08};
-    // 团高度至少是团内最高格子 size_z 的这么多倍，才算墙而不是饼
-    double cluster_aspect_k_{2.0};
     // 编号团里坏格占比 ≥ 此值，整团扫光（别留几颗孤点）
     double cluster_wipe_ratio_{0.7};
-    int max_cluster_rings_{8};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;

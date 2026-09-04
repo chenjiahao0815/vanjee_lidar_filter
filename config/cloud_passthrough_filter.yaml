@@ -55,20 +55,13 @@ cloud_passthrough_filter_node:
 
     thr_ratio: 2.0
     # 近处 thr_z 绝对下限，避免贴雷达时门槛掉到几毫米
-    # 和下面的 cluster_min_h 对齐：单格想凭厚度免死，也得有实物那么厚
     thr_z_min: 0.05
-    # 连通团：三维下限 + 随距离放大；同高度再用更大的 XY 间距去接水平面
+    # 连通团只用于扫尾：三维下限 + 随距离放大；同高度再用更大的 XY 间距去接水平面
     cluster_link_m: 0.18
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
-
-    cluster_min_h: 0.08
-    # 团点跨度 H 必须 ≥ k × 团内最高格子的 size_z，否则当饼，不保护
-    cluster_aspect_k: 1.5
-    # 编号团里坏格占比 ≥ 此值，整团扫光
+    # 编号团里坏格占比 ≥ 此值，整团扫光（不保护，每格自己按厚度删）
     cluster_wipe_ratio: 0.7
-    min_cluster_rings: 2     # 最远处的下限
-    max_cluster_rings: 3     # 非常近时的上限
 
     # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"
