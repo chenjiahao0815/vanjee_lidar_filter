@@ -49,13 +49,22 @@ cloud_passthrough_filter_node:
     base_z: 0.1
     max_xy: 0.5
     max_z: 0.5
-    thr_ratio: 0.5
+    thr_ratio: 2.0
+    # 近处 thr_z 绝对下限，避免贴雷达时门槛掉到几毫米
+    # 和下面的 cluster_min_h 对齐：单格想凭厚度免死，也得有实物那么厚
+    thr_z_min: 0.05
     # 连通团：三维下限 + 随距离放大；同高度再用更大的 XY 间距去接水平面
     cluster_link_m: 0.18
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
 
-    min_cluster_rings: 2
+    # 团保护先看物理高度：整团必须真的立起 cluster_min_h 才算实物，扁的一律毙
+    # 线数门槛不再是定值，按 h/(r·ang_v) 折出来再两端夹住
+    #   r < 2.29 m → 3 根线，r ≥ 2.29 m → 2 根线（启动日志会打这条曲线）
+    # 上限只用来挡一两根线的飞点，压不住扁团，扁不扁交给 cluster_min_h
+    cluster_min_h: 0.08
+    min_cluster_rings: 2     # 最远处的下限
+    max_cluster_rings: 3     # 非常近时的上限
 
     # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"

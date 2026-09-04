@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -147,10 +148,13 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
     this->declare_parameter("thr_ratio", 0.5);
+    this->declare_parameter("thr_z_min", 0.03);
     this->declare_parameter("cluster_link_m", 0.18);
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
     this->declare_parameter("min_cluster_rings", 2);
+    this->declare_parameter("cluster_min_h", 0.08);
+    this->declare_parameter("max_cluster_rings", 8);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -189,6 +193,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     max_xy_ = this->get_parameter("max_xy").as_double();
     max_z_ = this->get_parameter("max_z").as_double();
     thr_ratio_ = this->get_parameter("thr_ratio").as_double();
+    thr_z_min_ = this->get_parameter("thr_z_min").as_double();
+    if (thr_z_min_ < 0.0) {
+        thr_z_min_ = 0.0;
+    }
     cluster_link_m_ = this->get_parameter("cluster_link_m").as_double();
     cluster_link_k_ = this->get_parameter("cluster_link_k").as_double();
     cluster_plane_k_ = this->get_parameter("cluster_plane_k").as_double();
@@ -204,6 +212,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     min_cluster_rings_ = this->get_parameter("min_cluster_rings").as_int();
     if (min_cluster_rings_ < 1) {
         min_cluster_rings_ = 2;
+    }
+    cluster_min_h_ = this->get_parameter("cluster_min_h").as_double();
+    if (cluster_min_h_ <= 0.0) {
+        cluster_min_h_ = 0.08;
+    }
+    max_cluster_rings_ = this->get_parameter("max_cluster_rings").as_int();
+    if (max_cluster_rings_ < min_cluster_rings_) {
+        max_cluster_rings_ = min_cluster_rings_;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -324,11 +340,18 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f, "
-                    "连通团 link=%.2f m k3d=%.1f k_xy=%.1f, 团最少 %d 根线",
-                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_,
-                    cluster_link_m_, cluster_link_k_, cluster_plane_k_,
-                    min_cluster_rings_);
+                    "横向=1×线间距 纵向=2×线间距, thr_ratio=%.2f thr_z_min=%.3f, "
+                    "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
+                    ang_h_, ang_v_, base_xy_, base_z_, thr_ratio_, thr_z_min_,
+                    cluster_link_m_, cluster_link_k_, cluster_plane_k_);
+        RCLCPP_INFO(this->get_logger(),
+                    "  团保护: 实物最小高度 cluster_min_h=%.3f m, 线数门槛夹在 [%d, %d]",
+                    cluster_min_h_, min_cluster_rings_, max_cluster_rings_);
+        for (double r : {0.3, 0.5, 1.0, 2.0, 2.83}) {
+            RCLCPP_INFO(this->get_logger(),
+                        "    r=%.2f 线间距=%.4f m → 至少 %d 根线",
+                        r, r * ang_v_, requiredRings(r));
+        }
         logVoxelScaleSamples();
     }
 }
@@ -362,21 +385,95 @@ void CloudPassthroughFilterNode::removeNonFinitePointsInPlace(
             return;
         }
         const std::size_t before = cloud->points.size();
-        auto it = std::remove_if(cloud->points.begin(), cloud->points.end(),
-            [](const pcl::PointXYZ& p) {
-                return !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z);
-            });
-        if (it == cloud->points.end()) {
+        // 线号数组要和点一起压缩，否则后面按下标取线号会错位
+        const bool track_ring = have_ring_ && ring_of_cur_.size() == before;
+        std::size_t write = 0;
+        for (std::size_t i = 0; i < before; ++i) {
+            const auto& p = cloud->points[i];
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                continue;
+            }
+            if (write != i) {
+                cloud->points[write] = p;
+            }
+            if (track_ring) {
+                ring_of_cur_[write] = ring_of_cur_[i];
+            }
+            ++write;
+        }
+        if (write == before) {
             cloud->width = static_cast<uint32_t>(cloud->points.size());
             cloud->height = 1;
             cloud->is_dense = true;
             return;
         }
-        cloud->points.erase(it, cloud->points.end());
+        cloud->points.resize(write);
+        if (track_ring) {
+            ring_of_cur_.resize(write);
+        }
         cloud->width = static_cast<uint32_t>(cloud->points.size());
         cloud->height = 1;
         cloud->is_dense = true;
         PT_WARN("移除非法点(NaN/Inf): %zu → %zu", before, cloud->points.size());
+    }
+
+bool CloudPassthroughFilterNode::loadRingField(const sensor_msgs::msg::PointCloud2& msg)
+    {
+        ring_of_cur_.clear();
+        have_ring_ = false;
+
+        const sensor_msgs::msg::PointField* ring_field = nullptr;
+        for (const auto& f : msg.fields) {
+            if (f.name == "ring") {
+                ring_field = &f;
+                break;
+            }
+        }
+        if (ring_field == nullptr || msg.point_step == 0) {
+            return false;
+        }
+
+        const size_t n = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
+        if (msg.data.size() < n * msg.point_step) {
+            return false;
+        }
+        ring_of_cur_.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* src = msg.data.data() + i * msg.point_step + ring_field->offset;
+            uint16_t r = 0;
+            switch (ring_field->datatype) {
+                case sensor_msgs::msg::PointField::UINT8:
+                case sensor_msgs::msg::PointField::INT8:
+                    r = static_cast<uint16_t>(*src);
+                    break;
+                case sensor_msgs::msg::PointField::UINT16:
+                case sensor_msgs::msg::PointField::INT16: {
+                    uint16_t v = 0;
+                    std::memcpy(&v, src, sizeof(v));
+                    r = v;
+                    break;
+                }
+                case sensor_msgs::msg::PointField::UINT32:
+                case sensor_msgs::msg::PointField::INT32: {
+                    uint32_t v = 0;
+                    std::memcpy(&v, src, sizeof(v));
+                    r = static_cast<uint16_t>(v);
+                    break;
+                }
+                case sensor_msgs::msg::PointField::FLOAT32: {
+                    float v = 0.0f;
+                    std::memcpy(&v, src, sizeof(v));
+                    r = static_cast<uint16_t>(std::max(0.0f, v));
+                    break;
+                }
+                default:
+                    ring_of_cur_.clear();
+                    return false;
+            }
+            ring_of_cur_[i] = r;
+        }
+        have_ring_ = true;
+        return true;
     }
 
 void CloudPassthroughFilterNode::publish_cloud(
@@ -408,11 +505,24 @@ CloudPassthroughFilterNode::passthrough_filter_cpu(
             return filtered;
         }
         filtered->points.reserve(std::max(filtered->points.capacity(), cloud->size()));
-        for (const auto& p : cloud->points) {
+        const bool track_ring = have_ring_ && ring_of_cur_.size() == cloud->size();
+        if (track_ring) {
+            ring_scratch_.clear();
+            ring_scratch_.reserve(cloud->size());
+        }
+        const std::size_t n = cloud->points.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& p = cloud->points[i];
             const float value = (dimension == 0) ? p.x : ((dimension == 1) ? p.y : p.z);
             if (value >= lower_limit && value <= upper_limit) {
                 filtered->points.push_back(p);
+                if (track_ring) {
+                    ring_scratch_.push_back(ring_of_cur_[i]);
+                }
             }
+        }
+        if (track_ring) {
+            ring_of_cur_.swap(ring_scratch_);
         }
         filtered->width = static_cast<uint32_t>(filtered->points.size());
         return filtered;
@@ -436,6 +546,8 @@ void CloudPassthroughFilterNode::cloud_callback(
 
         auto current = memory_pool_->acquire();
         pcl::fromROSMsg(*msg, *current);
+        // 线号必须从原始消息取，pcl::PointXYZ 会把 ring 字段丢掉
+        loadRingField(*msg);
 
         if (current->empty()) {
             PT_WARN("收到空点云");
@@ -554,6 +666,9 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
     s.size_z = std::min(base_z * static_cast<double>(s.mult_z), max_z_);
 
     s.thr_z = s.line_gap * thr_ratio_;
+    if (s.thr_z < thr_z_min_) {
+        s.thr_z = thr_z_min_;
+    }
     if (s.thr_z >= s.size_z) {
         s.thr_z = 0.5 * s.size_z;
     }
@@ -627,7 +742,7 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
             v.cy = static_cast<float>((static_cast<double>(iy) + 0.5) * base_xy_);
             v.idx.push_back(i);
             v.keep = true;
-            addRing(v, p.x, p.y, p.z);
+            addRing(v, i, p.x, p.y, p.z);
             fine_grid_.emplace(key, std::move(v));
         } else {
             Voxel& v = it->second;
@@ -639,7 +754,7 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
                 v.zmax = p.z;
             }
             v.idx.push_back(i);
-            addRing(v, p.x, p.y, p.z);
+            addRing(v, i, p.x, p.y, p.z);
         }
         ++loaded;
     }
@@ -773,13 +888,33 @@ int CloudPassthroughFilterNode::ringId(float x, float y, float z) const
         std::atan2(static_cast<double>(z), std::max(rxy, 1e-6)) / std::max(ang_v_, 1e-6)));
 }
 
-void CloudPassthroughFilterNode::addRing(Voxel& v, float x, float y, float z) const
+int CloudPassthroughFilterNode::ringOfPoint(uint32_t i, float x, float y, float z) const
+{
+    if (have_ring_ && static_cast<size_t>(i) < ring_of_cur_.size()) {
+        return static_cast<int>(ring_of_cur_[i]);
+    }
+    // 退路：atan2 只是仰角，近处同一根线扫到平面会被算成好几根，别当准值用
+    return ringId(x, y, z);
+}
+
+void CloudPassthroughFilterNode::addRing(Voxel& v, uint32_t i, float x, float y, float z) const
 {
     constexpr int kBias = 32;
-    const int bit = ringId(x, y, z) + kBias;
+    const int ring = ringOfPoint(i, x, y, z);
+    const int bit = have_ring_ ? ring : (ring + kBias);
     if (bit >= 0 && bit < 64) {
         v.ring_mask |= (1ull << bit);
     }
+}
+
+int CloudPassthroughFilterNode::requiredRings(double r) const
+{
+    // 线间距随距离长大：同一个物理高度，近处要占更多根线，远处只占一两根
+    const double gap = std::max(std::max(r, 1e-3) * ang_v_, 1e-6);
+    const int n = static_cast<int>(std::ceil(cluster_min_h_ / gap));
+    const int lo = std::max(1, min_cluster_rings_);
+    const int hi = std::max(lo, max_cluster_rings_);
+    return std::min(std::max(n, lo), hi);
 }
 
 bool CloudPassthroughFilterNode::hasNeighborSupport(
@@ -810,7 +945,13 @@ bool CloudPassthroughFilterNode::hasNeighborSupport(
             continue;
         }
 
-        if ((other->ring_mask & ~v.ring_mask) != 0ull) {
+        if ((other->ring_mask & ~v.ring_mask) == 0ull) {
+            continue;
+        }
+        // 邻格多一根线还不够：两格合起来得真的高过 cluster_min_h，
+        // 否则一片贴地的扁噪点会互相当旁证，一格格全被救回来
+        const float span2 = std::max(v.zmax, other->zmax) - std::min(v.zmin, other->zmin);
+        if (span2 >= static_cast<float>(cluster_min_h_)) {
             return true;
         }
     }
@@ -894,10 +1035,32 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
 
     std::vector<uint64_t> root_mask(n, 0ull);
     std::vector<int> root_size(n, 0);
+    std::vector<float> root_rmin(n, 1e9f);
+    std::vector<float> root_zmin(n, 1e9f);
+    std::vector<float> root_zmax(n, -1e9f);
     for (size_t i = 0; i < n; ++i) {
         const int r = find(static_cast<int>(i));
-        root_mask[static_cast<size_t>(r)] |= all[i]->ring_mask;
-        ++root_size[static_cast<size_t>(r)];
+        const size_t ri = static_cast<size_t>(r);
+        root_mask[ri] |= all[i]->ring_mask;
+        ++root_size[ri];
+        root_rmin[ri] = std::min(root_rmin[ri], all[i]->r);
+        root_zmin[ri] = std::min(root_zmin[ri], all[i]->zmin);
+        root_zmax[ri] = std::max(root_zmax[ri], all[i]->zmax);
+    }
+
+    // 线数门槛按团里最近的那格算，最近处最严
+    std::vector<int> root_need(n, 0);
+    std::vector<char> root_ok(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (find(static_cast<int>(i)) != static_cast<int>(i)) {
+            continue;
+        }
+        root_need[i] = requiredRings(static_cast<double>(root_rmin[i]));
+        const float span = root_zmax[i] - root_zmin[i];
+        const bool rings_ok = ringBitCount(root_mask[i]) >= root_need[i];
+        // 线数够只说明被扫到得多；还得真的立起来 cluster_min_h 才算实物
+        const bool span_ok = span >= static_cast<float>(cluster_min_h_);
+        root_ok[i] = (rings_ok && span_ok) ? 1 : 0;
     }
 
     // 根 -> 团号 1,2,3...；至少两格才算团
@@ -915,26 +1078,37 @@ void CloudPassthroughFilterNode::markMultiRingClusters(std::vector<Voxel*>& all)
     size_t multi_n = 0;
     size_t protect_voxels = 0;
     size_t protect_pts = 0;
+    size_t drop_thin = 0;   // 线数够但太扁
+    size_t drop_rings = 0;  // 这个距离上线数不够
     for (size_t i = 0; i < n; ++i) {
         if (find(static_cast<int>(i)) != static_cast<int>(i)) {
             continue;
         }
-        if (ringBitCount(root_mask[i]) >= min_cluster_rings_) {
+        if (root_ok[i] != 0) {
             ++multi_n;
+        } else if (ringBitCount(root_mask[i]) >= root_need[i]) {
+            ++drop_thin;
+        } else {
+            ++drop_rings;
         }
     }
     for (size_t i = 0; i < n; ++i) {
-        const int r = find(static_cast<int>(i));
-        all[i]->cluster_id = root_to_id[static_cast<size_t>(r)];
-        all[i]->cluster_rings = ringBitCount(root_mask[static_cast<size_t>(r)]);
-        if (all[i]->cluster_rings >= min_cluster_rings_) {
+        const size_t r = static_cast<size_t>(find(static_cast<int>(i)));
+        all[i]->cluster_id = root_to_id[r];
+        all[i]->cluster_rings = ringBitCount(root_mask[r]);
+        all[i]->need_rings = root_need[r];
+        all[i]->cluster_span = root_zmax[r] - root_zmin[r];
+        if (root_ok[r] != 0) {
             all[i]->keep = true;
             ++protect_voxels;
             protect_pts += all[i]->count;
         }
     }
-    PT_INFO("连通团保护: 多线团 %zu, 编号团 %d, 保护 %zu 格 / %zu 点 (最少 %d 根线, link=%.2f k3d=%.1f k_xy=%.1f)",
-            multi_n, next_id - 1, protect_voxels, protect_pts, min_cluster_rings_,
+    PT_INFO("连通团保护: 过关团 %zu, 太扁毙 %zu, 线不够毙 %zu, 编号团 %d, 保护 %zu 格 / %zu 点 "
+            "(线号=%s, min_h=%.3f, 线数 %d~%d, link=%.2f k3d=%.1f k_xy=%.1f)",
+            multi_n, drop_thin, drop_rings, next_id - 1, protect_voxels, protect_pts,
+            have_ring_ ? "真实ring" : "atan2估计", cluster_min_h_,
+            min_cluster_rings_, max_cluster_rings_,
             cluster_link_m_, cluster_link_k_, cluster_plane_k_);
 }
 
@@ -1282,7 +1456,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         boxes_publisher_->publish(arr);
     }
 
-    // 3) 有点的合成体素：半透明立方体；格顶一条字
+    // 3) 有点的合成体素：半透明红=删格 / 绿=留格；格内画穿过的雷达线
     if (voxels_publisher_ && publish_occupied_voxels_) {
         visualization_msgs::msg::MarkerArray arr;
         visualization_msgs::msg::Marker clear;
@@ -1294,8 +1468,10 @@ void CloudPassthroughFilterNode::publishFilterDebug(
 
         constexpr size_t kMaxVoxels = 2500;
         size_t drawn = 0;
-        int cube_id = 2;
+        int cube_id = 10;
+        int arrow_id = 5000;
         int text_id = 10000;
+
         for (const auto& entry : grid_) {
             if (drawn >= kMaxVoxels) {
                 break;
@@ -1310,6 +1486,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             const double cx = xmin + 0.5 * sx;
             const double cy = ymin + 0.5 * sx;
             const double cz = zmin + 0.5 * sz;
+            const bool is_bad = bad_set.count(&v) != 0;
 
             visualization_msgs::msg::Marker cube;
             cube.header = header;
@@ -1324,11 +1501,69 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             cube.scale.x = sx;
             cube.scale.y = sx;
             cube.scale.z = sz;
-            cube.color.r = 1.0f;
-            cube.color.g = 1.0f;
-            cube.color.b = 0.75f;
-            cube.color.a = 0.22f;
+            if (is_bad) {
+                cube.color.r = 0.95f;
+                cube.color.g = 0.2f;
+                cube.color.b = 0.2f;
+                cube.color.a = 0.28f;
+            } else {
+                cube.color.r = 0.2f;
+                cube.color.g = 0.85f;
+                cube.color.b = 0.3f;
+                cube.color.a = 0.28f;
+            }
             arr.markers.push_back(cube);
+
+            // 格内按线号分组：方位从小到大，细箭头表示穿过方向
+            if (pass_cloud && !v.idx.empty()) {
+                std::unordered_map<int, std::vector<const pcl::PointXYZ*>> by_ring;
+                by_ring.reserve(8);
+                for (uint32_t idx : v.idx) {
+                    if (idx >= n_pass) {
+                        continue;
+                    }
+                    const auto& p = pass_cloud->points[idx];
+                    by_ring[ringOfPoint(idx, p.x, p.y, p.z)].push_back(&p);
+                }
+                for (auto& ring_entry : by_ring) {
+                    auto& pts = ring_entry.second;
+                    if (pts.size() < 2) {
+                        continue;
+                    }
+                    std::sort(pts.begin(), pts.end(), [](const pcl::PointXYZ* a, const pcl::PointXYZ* b) {
+                        return std::atan2(static_cast<double>(a->y), static_cast<double>(a->x)) <
+                               std::atan2(static_cast<double>(b->y), static_cast<double>(b->x));
+                    });
+                    const pcl::PointXYZ* first = pts.front();
+                    const pcl::PointXYZ* last = pts.back();
+                    visualization_msgs::msg::Marker arrow;
+                    arrow.header = header;
+                    arrow.ns = "occupied_voxels";
+                    arrow.id = arrow_id++;
+                    arrow.type = visualization_msgs::msg::Marker::ARROW;
+                    arrow.action = visualization_msgs::msg::Marker::ADD;
+                    arrow.pose.orientation.w = 1.0;
+                    arrow.color.r = 0.75f;
+                    arrow.color.g = 0.55f;
+                    arrow.color.b = 1.0f;
+                    arrow.color.a = 0.95f;
+                    // 两点式：杆是细线，箭头只在末尾
+                    arrow.scale.x = 0.0015;
+                    arrow.scale.y = 0.004;
+                    arrow.scale.z = 0.010;
+                    geometry_msgs::msg::Point p0;
+                    p0.x = first->x;
+                    p0.y = first->y;
+                    p0.z = first->z;
+                    geometry_msgs::msg::Point p1;
+                    p1.x = last->x;
+                    p1.y = last->y;
+                    p1.z = last->z;
+                    arrow.points.push_back(p0);
+                    arrow.points.push_back(p1);
+                    arr.markers.push_back(arrow);
+                }
+            }
 
             visualization_msgs::msg::Marker text;
             text.header = header;
@@ -1340,18 +1575,19 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             text.pose.position.x = cx;
             text.pose.position.y = cy;
             text.pose.position.z = zmin + sz + 0.03;
-            text.scale.z = 0.027;
+            text.scale.z = 0.018;
             text.color.r = 1.0f;
             text.color.g = 1.0f;
             text.color.b = 0.85f;
             text.color.a = 1.0f;
             char buf[80];
-            const int rings = std::max(v.cluster_rings, 0);
+            const float zspan = v.zmax - v.zmin;
             if (v.cluster_id > 0) {
-                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%d,n%d",
-                              cx, cy, cz, v.cluster_id, rings);
+                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f,t%d",
+                              cx, cy, cz, zspan, v.cluster_id);
             } else {
-                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,n%d", cx, cy, cz, rings);
+                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f",
+                              cx, cy, cz, zspan);
             }
             text.text = buf;
             arr.markers.push_back(text);
