@@ -34,12 +34,11 @@ cloud_passthrough_filter_node:
     memory_pool_reserve: 1000000
     cloud_log_interval_sec: 1.0
 
-    # 我们自己的立方体，雷达中心，长宽高
-    cube_length: 4.0
-    cube_width: 4.0
+    # 立方体
+    cube_length: 5.0
+    cube_width: 5.0
     cube_height: 2.0
 
-    # 细格 base；合成后横向=1×线间距，纵向=size_z_ratio×线间距
     removed_topic: "/vanjee/lidar_removed"
     enable_voxel_filter: true
     ang_h: 0.0034906585
@@ -48,20 +47,21 @@ cloud_passthrough_filter_node:
     base_xy: 0.1
     base_z: 0.1
     max_xy: 0.5
-    max_z: 0.5
-
-    size_z_ratio: 4.0
+    max_z: 1.0
     size_z_min: 0.1
+    
+    size_xy_ratio: 2.0
+    size_z_ratio: 4.0
 
-    thr_ratio: 2.0
-    # 近处 thr_z 绝对下限，避免贴雷达时门槛掉到几毫米
+
+    thr_ratio: 1.0
     thr_z_min: 0.05
-    # 连通团只用于扫尾：三维下限 + 随距离放大；同高度再用更大的 XY 间距去接水平面
+
+    # 聚类
     cluster_link_m: 0.18
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
-    # 编号团里坏格占比 ≥ 此值，整团扫光（不保护，每格自己按厚度删）
-    cluster_wipe_ratio: 0.7
+    cluster_wipe_ratio: 0.85
 
     # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"

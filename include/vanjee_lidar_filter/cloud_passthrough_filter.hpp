@@ -68,9 +68,13 @@ struct Voxel {
     float cy{0.0f};
     float size_xy{0.0f};
     float size_z{0.0f};
+    int merge_nxy{1};  // 合进本格时用的横向倍率，画框必须跟这个走
+    int merge_nz{1};
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
     int cluster_id{0};  // 连通团编号，0=未成团/单格；只给整团扫用，不保护
+    int cell_id{0};     // 本帧体素格子编号，可视化/删点日志对照用
+    bool wiped_by_cluster{false};  // 因整团扫被连带删掉
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -175,6 +179,8 @@ private:
     double base_z_{0.01};
     double max_xy_{0.5};
     double max_z_{0.5};
+    // 横向边长 = size_xy_ratio × 线间距，再夹在 [base_xy, max_xy]
+    double size_xy_ratio_{1.0};
     // 纵向边长 = size_z_ratio × 线间距，再夹在 [size_z_min, max_z]
     double size_z_ratio_{4.0};
     double size_z_min_{0.1};

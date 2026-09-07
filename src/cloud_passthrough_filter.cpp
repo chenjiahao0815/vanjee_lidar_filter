@@ -147,6 +147,7 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("base_z", 0.01);
     this->declare_parameter("max_xy", 0.5);
     this->declare_parameter("max_z", 0.5);
+    this->declare_parameter("size_xy_ratio", 1.0);
     this->declare_parameter("size_z_ratio", 4.0);
     this->declare_parameter("size_z_min", 0.1);
     this->declare_parameter("thr_ratio", 0.5);
@@ -192,6 +193,10 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     base_z_ = this->get_parameter("base_z").as_double();
     max_xy_ = this->get_parameter("max_xy").as_double();
     max_z_ = this->get_parameter("max_z").as_double();
+    size_xy_ratio_ = this->get_parameter("size_xy_ratio").as_double();
+    if (size_xy_ratio_ <= 0.0) {
+        size_xy_ratio_ = 1.0;
+    }
     size_z_ratio_ = this->get_parameter("size_z_ratio").as_double();
     if (size_z_ratio_ <= 0.0) {
         size_z_ratio_ = 4.0;
@@ -340,9 +345,12 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_length_, cube_width_, cube_height_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向=1×线间距 纵向=%.1f×线间距夹[%.3f,%.3f], thr_ratio=%.2f thr_z_min=%.3f, "
+                    "横向=%.2f×线间距夹[%.3f,%.3f] 纵向=%.1f×线间距夹[%.3f,%.3f], "
+                    "thr_ratio=%.2f thr_z_min=%.3f, "
                     "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
-                    ang_h_, ang_v_, base_xy_, base_z_, size_z_ratio_, size_z_min_, max_z_,
+                    ang_h_, ang_v_, base_xy_, base_z_,
+                    size_xy_ratio_, base_xy_, max_xy_,
+                    size_z_ratio_, size_z_min_, max_z_,
                     thr_ratio_, thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
@@ -364,7 +372,7 @@ void CloudPassthroughFilterNode::updateFrameLogGate()
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        const double elapsed_sec =
+        const double elapsed_sec = 
             std::chrono::duration<double>(now - last_cloud_log_time_).count();
         if (cloud_log_interval_sec_ <= 0.0 || elapsed_sec >= cloud_log_interval_sec_) {
             frame_log_enabled_ = true;
@@ -654,8 +662,7 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
     // 用这个间距来决定格子应该多大
     s.line_gap = rr * ang_v_;
     s.pt_gap = s.line_gap;
-    s.size_xy = std::min(std::max(s.line_gap, base_xy), max_xy_);
-    // 纵向按线间距放大：近处有 size_z_min 托底，远处顶到 max_z
+    s.size_xy = std::min(std::max(size_xy_ratio_ * s.line_gap, base_xy), max_xy_);
     s.size_z = std::min(std::max(size_z_ratio_ * s.line_gap, size_z_min_), max_z_);
     s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy)));
     s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z)));
@@ -666,8 +673,8 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
     if (s.thr_z < thr_z_min_) {
         s.thr_z = thr_z_min_;
     }
-    if (s.thr_z >= s.size_z) {
-        s.thr_z = 0.5 * s.size_z;
+    if (s.thr_z > s.size_z) {
+        s.thr_z = s.size_z;
     }
 
     s.inv_xy = 1.0 / std::max(s.size_xy, 1e-6);
@@ -756,6 +763,10 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
     }
 
     mergeFineVoxels();
+    int cell_n = 0;
+    for (auto& entry : grid_) {
+        entry.second.cell_id = ++cell_n;
+    }
     PT_INFO("体素装格: 框内 %u 点, 框外跳过 %u, 细格 %zu, 合成后 %zu 格",
             loaded, skipped_outside, fine_grid_.size(), grid_.size());
 }
@@ -826,9 +837,17 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
             v.cy = static_cast<float>(center_y);
             v.ring_mask = fine.ring_mask;
             v.idx = fine.idx;
+            v.merge_nxy = std::max(1, n.nxy);
+            v.merge_nz = std::max(1, n.nz);
             grid_.emplace(ckey, std::move(v));
         } else {
             Voxel& v = it->second;
+            if (n.nxy > v.merge_nxy) {
+                v.merge_nxy = n.nxy;
+            }
+            if (n.nz > v.merge_nz) {
+                v.merge_nz = n.nz;
+            }
             const double w_old = static_cast<double>(v.count);
             const double w_new = static_cast<double>(fine.count);
             const double w = std::max(w_old + w_new, 1.0);
@@ -1008,6 +1027,7 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 
     for (Voxel* vp : all) {
         Voxel& v = *vp;
+        v.wiped_by_cluster = false;
         const float span = v.zmax - v.zmin;
         if (span >= v.thr_z) {
             ++thick_n;
@@ -1057,6 +1077,7 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
             if (bad_set.count(v) != 0) {
                 continue;
             }
+            v->wiped_by_cluster = true;
             bad.push_back(v);
             bad_set.insert(v);
             ++wipe_extra;
@@ -1096,6 +1117,23 @@ void CloudPassthroughFilterNode::removePointsInBadVoxels(
     for (const Voxel* v : bad_voxels) {
         if (!v) {
             continue;
+        }
+        const float zmid = 0.5f * (v->zmin + v->zmax);
+        const float zspan = v->zmax - v->zmin;
+        if (v->cluster_id > 0) {
+            if (v->wiped_by_cluster) {
+                PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f t%d [团删]",
+                        v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z, v->cluster_id);
+            } else {
+                PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f t%d",
+                        v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z, v->cluster_id);
+            }
+        } else if (v->wiped_by_cluster) {
+            PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f [团删]",
+                    v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z);
+        } else {
+            PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f",
+                    v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z);
         }
         for (uint32_t idx : v->idx) {
             if (idx < n && drop[idx] == 0) {
@@ -1300,7 +1338,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         verdict_publisher_->publish(msg);
     }
 
-    // 2) 范围线框：青=立方体，橙=直通；头顶一行统计
+    // 2) 范围线框：青=立方体，橙=直通
     if (boxes_publisher_) {
         visualization_msgs::msg::MarkerArray arr;
         visualization_msgs::msg::Marker clear;
@@ -1345,32 +1383,10 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                        axes_[1].limit_min, axes_[1].limit_max,
                        axes_[2].limit_min, axes_[2].limit_max);
         arr.markers.push_back(pass);
-
-        visualization_msgs::msg::Marker text;
-        text.header = header;
-        text.ns = "filter_boxes";
-        text.id = 3;
-        text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-        text.action = visualization_msgs::msg::Marker::ADD;
-        text.pose.orientation.w = 1.0;
-        text.pose.position.x = 0.0;
-        text.pose.position.y = 0.0;
-        text.pose.position.z = 0.5 * cube_height_ + 0.35;
-        text.scale.z = 0.12;
-        text.color.r = 1.0f;
-        text.color.g = 1.0f;
-        text.color.b = 1.0f;
-        text.color.a = 1.0f;
-        char buf[192];
-        std::snprintf(buf, sizeof(buf),
-                      "del(红)=%zu  keep(绿)=%zu  cube-only(蓝)=%zu  voxels=%zu",
-                      n_del, n_keep, n_blue, grid_.size());
-        text.text = buf;
-        arr.markers.push_back(text);
         boxes_publisher_->publish(arr);
     }
 
-    // 3) 有点的合成体素：半透明红=删格 / 绿=留格；格内画穿过的雷达线
+    // 3) 有点的合成体素：半透明红=删格 / 绿=留格
     if (voxels_publisher_ && publish_occupied_voxels_) {
         visualization_msgs::msg::MarkerArray arr;
         visualization_msgs::msg::Marker clear;
@@ -1383,7 +1399,6 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         constexpr size_t kMaxVoxels = 2500;
         size_t drawn = 0;
         int cube_id = 10;
-        int arrow_id = 5000;
         int text_id = 10000;
 
         for (const auto& entry : grid_) {
@@ -1391,8 +1406,10 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                 break;
             }
             const Voxel& v = entry.second;
-            const double sx = std::max(static_cast<double>(v.size_xy), base_xy_);
-            const double sz = std::max(static_cast<double>(v.size_z), base_z_);
+            const double sx = std::max(base_xy_ * static_cast<double>(std::max(v.merge_nxy, 1)),
+                                      base_xy_);
+            const double sz = std::max(base_z_ * static_cast<double>(std::max(v.merge_nz, 1)),
+                                      base_z_);
             const double xmin = static_cast<double>(v.ix) * sx;
             const double ymin = static_cast<double>(v.iy) * sx;
             const double zmin = static_cast<double>(v.iz) * sz;
@@ -1428,57 +1445,6 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             }
             arr.markers.push_back(cube);
 
-            // 格内按线号分组：方位从小到大，细箭头表示穿过方向
-            if (pass_cloud && !v.idx.empty()) {
-                std::unordered_map<int, std::vector<const pcl::PointXYZ*>> by_ring;
-                by_ring.reserve(8);
-                for (uint32_t idx : v.idx) {
-                    if (idx >= n_pass) {
-                        continue;
-                    }
-                    const auto& p = pass_cloud->points[idx];
-                    by_ring[ringOfPoint(idx, p.x, p.y, p.z)].push_back(&p);
-                }
-                for (auto& ring_entry : by_ring) {
-                    auto& pts = ring_entry.second;
-                    if (pts.size() < 2) {
-                        continue;
-                    }
-                    std::sort(pts.begin(), pts.end(), [](const pcl::PointXYZ* a, const pcl::PointXYZ* b) {
-                        return std::atan2(static_cast<double>(a->y), static_cast<double>(a->x)) <
-                               std::atan2(static_cast<double>(b->y), static_cast<double>(b->x));
-                    });
-                    const pcl::PointXYZ* first = pts.front();
-                    const pcl::PointXYZ* last = pts.back();
-                    visualization_msgs::msg::Marker arrow;
-                    arrow.header = header;
-                    arrow.ns = "occupied_voxels";
-                    arrow.id = arrow_id++;
-                    arrow.type = visualization_msgs::msg::Marker::ARROW;
-                    arrow.action = visualization_msgs::msg::Marker::ADD;
-                    arrow.pose.orientation.w = 1.0;
-                    arrow.color.r = 0.75f;
-                    arrow.color.g = 0.55f;
-                    arrow.color.b = 1.0f;
-                    arrow.color.a = 0.95f;
-                    // 两点式：杆是细线，箭头只在末尾
-                    arrow.scale.x = 0.0015;
-                    arrow.scale.y = 0.004;
-                    arrow.scale.z = 0.010;
-                    geometry_msgs::msg::Point p0;
-                    p0.x = first->x;
-                    p0.y = first->y;
-                    p0.z = first->z;
-                    geometry_msgs::msg::Point p1;
-                    p1.x = last->x;
-                    p1.y = last->y;
-                    p1.z = last->z;
-                    arrow.points.push_back(p0);
-                    arrow.points.push_back(p1);
-                    arr.markers.push_back(arrow);
-                }
-            }
-
             visualization_msgs::msg::Marker text;
             text.header = header;
             text.ns = "occupied_voxels";
@@ -1494,14 +1460,14 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             text.color.g = 1.0f;
             text.color.b = 0.85f;
             text.color.a = 1.0f;
-            char buf[80];
+            char buf[112];
             const float zspan = v.zmax - v.zmin;
             if (v.cluster_id > 0) {
-                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f,t%d",
-                              cx, cy, cz, zspan, v.cluster_id);
+                std::snprintf(buf, sizeof(buf), "z:%.2f,span:%.2f,thr:%.2f,t%d,#%d",
+                              cz, zspan, v.thr_z, v.cluster_id, v.cell_id);
             } else {
-                std::snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f",
-                              cx, cy, cz, zspan);
+                std::snprintf(buf, sizeof(buf), "z:%.2f,span:%.2f,thr:%.2f,#%d",
+                              cz, zspan, v.thr_z, v.cell_id);
             }
             text.text = buf;
             arr.markers.push_back(text);
