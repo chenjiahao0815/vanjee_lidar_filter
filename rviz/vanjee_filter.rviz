@@ -65,6 +65,26 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /vanjee/voxel_markers
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: DeletedVoxels
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /vanjee/voxel_markers_deleted
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: KeptVoxels
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /vanjee/voxel_markers_kept
+      Value: false
     - Alpha: 1
       Class: rviz_default_plugins/PointCloud2
       Color: 80; 200; 255

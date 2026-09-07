@@ -102,9 +102,21 @@ CloudPassthroughFilterNode::CloudPassthroughFilterNode()
             boxes_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
                 boxes_topic_, viz_qos);
         }
-        if (publish_occupied_voxels_ && !voxels_topic_.empty()) {
-            voxels_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-                voxels_topic_, viz_qos);
+        if (publish_occupied_voxels_) {
+            if (!voxels_topic_.empty()) {
+                voxels_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                    voxels_topic_, viz_qos);
+            }
+            if (!voxels_deleted_topic_.empty()) {
+                voxels_deleted_publisher_ =
+                    this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                        voxels_deleted_topic_, viz_qos);
+            }
+            if (!voxels_kept_topic_.empty()) {
+                voxels_kept_publisher_ =
+                    this->create_publisher<visualization_msgs::msg::MarkerArray>(
+                        voxels_kept_topic_, viz_qos);
+            }
         }
     }
 
@@ -159,6 +171,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
+    this->declare_parameter("voxels_deleted_topic", std::string("/vanjee/voxel_markers_deleted"));
+    this->declare_parameter("voxels_kept_topic", std::string("/vanjee/voxel_markers_kept"));
     this->declare_parameter("publish_occupied_voxels", true);
 
         input_topic_ = this->get_parameter("input_topic").as_string();
@@ -229,6 +243,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
     voxels_topic_ = this->get_parameter("voxels_topic").as_string();
+    voxels_deleted_topic_ = this->get_parameter("voxels_deleted_topic").as_string();
+    voxels_kept_topic_ = this->get_parameter("voxels_kept_topic").as_string();
     publish_occupied_voxels_ = this->get_parameter("publish_occupied_voxels").as_bool();
 
         axes_[0].name = 'x';
@@ -334,6 +350,8 @@ void CloudPassthroughFilterNode::log_startup() const
         RCLCPP_INFO(this->get_logger(), "  有点体素: %s (%s)",
                     voxels_topic_.c_str(),
                     publish_occupied_voxels_ ? "开" : "关");
+        RCLCPP_INFO(this->get_logger(), "  删格体素: %s", voxels_deleted_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  留格体素: %s", voxels_kept_topic_.c_str());
         }
         RCLCPP_INFO(this->get_logger(),
                     "  帧日志间隔: %.2f s (仅 debug_mode=false 时限频)",
@@ -1386,42 +1404,47 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         boxes_publisher_->publish(arr);
     }
 
-    // 3) 有点的合成体素：半透明红=删格 / 绿=留格
-    if (voxels_publisher_ && publish_occupied_voxels_) {
-        visualization_msgs::msg::MarkerArray arr;
-        visualization_msgs::msg::Marker clear;
-        clear.header = header;
-        clear.ns = "occupied_voxels";
-        clear.id = 0;
-        clear.action = visualization_msgs::msg::Marker::DELETEALL;
-        arr.markers.push_back(clear);
+    // 3) 有点的合成体素：合并话题 + 红删/绿留分开话题
+    if (publish_occupied_voxels_ &&
+        (voxels_publisher_ || voxels_deleted_publisher_ || voxels_kept_publisher_)) {
+        visualization_msgs::msg::MarkerArray arr_all;
+        visualization_msgs::msg::MarkerArray arr_del;
+        visualization_msgs::msg::MarkerArray arr_keep;
+
+        auto push_clear = [&](visualization_msgs::msg::MarkerArray& arr, const char* ns) {
+            visualization_msgs::msg::Marker clear;
+            clear.header = header;
+            clear.ns = ns;
+            clear.id = 0;
+            clear.action = visualization_msgs::msg::Marker::DELETEALL;
+            arr.markers.push_back(clear);
+        };
+        if (voxels_publisher_) {
+            push_clear(arr_all, "occupied_voxels");
+        }
+        if (voxels_deleted_publisher_) {
+            push_clear(arr_del, "deleted_voxels");
+        }
+        if (voxels_kept_publisher_) {
+            push_clear(arr_keep, "kept_voxels");
+        }
 
         constexpr size_t kMaxVoxels = 2500;
         size_t drawn = 0;
+        size_t drawn_del = 0;
+        size_t drawn_keep = 0;
         int cube_id = 10;
         int text_id = 10000;
 
-        for (const auto& entry : grid_) {
-            if (drawn >= kMaxVoxels) {
-                break;
-            }
-            const Voxel& v = entry.second;
-            const double sx = std::max(base_xy_ * static_cast<double>(std::max(v.merge_nxy, 1)),
-                                      base_xy_);
-            const double sz = std::max(base_z_ * static_cast<double>(std::max(v.merge_nz, 1)),
-                                      base_z_);
-            const double xmin = static_cast<double>(v.ix) * sx;
-            const double ymin = static_cast<double>(v.iy) * sx;
-            const double zmin = static_cast<double>(v.iz) * sz;
-
-            const double cx = xmin + 0.5 * sx;
-            const double cy = ymin + 0.5 * sx;
-            const double cz = zmin + 0.5 * sz;
-            const bool is_bad = bad_set.count(&v) != 0;
-
+        auto append_voxel = [&](visualization_msgs::msg::MarkerArray& arr,
+                                const char* ns,
+                                bool is_bad,
+                                double cx, double cy, double cz,
+                                double sx, double sz, double zmin,
+                                const Voxel& v) {
             visualization_msgs::msg::Marker cube;
             cube.header = header;
-            cube.ns = "occupied_voxels";
+            cube.ns = ns;
             cube.id = cube_id++;
             cube.type = visualization_msgs::msg::Marker::CUBE;
             cube.action = visualization_msgs::msg::Marker::ADD;
@@ -1447,7 +1470,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
 
             visualization_msgs::msg::Marker text;
             text.header = header;
-            text.ns = "occupied_voxels";
+            text.ns = ns;
             text.id = text_id++;
             text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
             text.action = visualization_msgs::msg::Marker::ADD;
@@ -1471,11 +1494,51 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             }
             text.text = buf;
             arr.markers.push_back(text);
+        };
+
+        for (const auto& entry : grid_) {
+            if (drawn >= kMaxVoxels) {
+                break;
+            }
+            const Voxel& v = entry.second;
+            const double sx = std::max(base_xy_ * static_cast<double>(std::max(v.merge_nxy, 1)),
+                                      base_xy_);
+            const double sz = std::max(base_z_ * static_cast<double>(std::max(v.merge_nz, 1)),
+                                      base_z_);
+            const double xmin = static_cast<double>(v.ix) * sx;
+            const double ymin = static_cast<double>(v.iy) * sx;
+            const double zmin = static_cast<double>(v.iz) * sz;
+            const double cx = xmin + 0.5 * sx;
+            const double cy = ymin + 0.5 * sx;
+            const double cz = zmin + 0.5 * sz;
+            const bool is_bad = bad_set.count(&v) != 0;
+
+            if (voxels_publisher_) {
+                append_voxel(arr_all, "occupied_voxels", is_bad, cx, cy, cz, sx, sz, zmin, v);
+            }
+            if (is_bad && voxels_deleted_publisher_) {
+                append_voxel(arr_del, "deleted_voxels", true, cx, cy, cz, sx, sz, zmin, v);
+                ++drawn_del;
+            }
+            if (!is_bad && voxels_kept_publisher_) {
+                append_voxel(arr_keep, "kept_voxels", false, cx, cy, cz, sx, sz, zmin, v);
+                ++drawn_keep;
+            }
             ++drawn;
         }
-        voxels_publisher_->publish(arr);
-        PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝(立方体无直通) %zu 有点体素 %zu/%zu",
-                n_del, n_keep, n_blue, drawn, grid_.size());
+
+        if (voxels_publisher_) {
+            voxels_publisher_->publish(arr_all);
+        }
+        if (voxels_deleted_publisher_) {
+            voxels_deleted_publisher_->publish(arr_del);
+        }
+        if (voxels_kept_publisher_) {
+            voxels_kept_publisher_->publish(arr_keep);
+        }
+        PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝(立方体无直通) %zu "
+                "体素合并 %zu 删格话题 %zu 留格话题 %zu / 总格 %zu",
+                n_del, n_keep, n_blue, drawn, drawn_del, drawn_keep, grid_.size());
     }
 }
 

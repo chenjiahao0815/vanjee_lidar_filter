@@ -142,6 +142,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr verdict_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr boxes_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxels_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxels_deleted_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxels_kept_publisher_;
     std::unique_ptr<PointCloudMemoryPool> memory_pool_;
 
     std::array<AxisSpec, 3> axes_{};
@@ -156,6 +158,8 @@ private:
     std::string verdict_topic_;
     std::string boxes_topic_;
     std::string voxels_topic_;
+    std::string voxels_deleted_topic_;
+    std::string voxels_kept_topic_;
     bool publish_occupied_voxels_{true};
 
     int memory_pool_size_{10};
