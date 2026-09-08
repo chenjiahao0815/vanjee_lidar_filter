@@ -82,6 +82,7 @@ struct Voxel {
     std::vector<uint32_t> idx;
     int cluster_id{0};  // 连通团编号，0=未成团/单格；可视化/日志用
     int cell_id{0};     // 本帧体素格子编号，可视化/删点日志对照用
+    bool plane_protected{false};  // 平面拟合保护：整团像真面，不按厚度删
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -128,9 +129,14 @@ private:
     bool inPassthrough(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void mergeFineVoxels();
-    // 接收有点的体素列表，返回需要删除的体素；真正删点另写
-    std::vector<Voxel*> collectBadVoxels();
+    // 薄格候选删；若所属连通团平面拟合够好则整团保护，不进坏格
+    std::vector<Voxel*> collectBadVoxels(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void assignClusters(std::vector<Voxel*>& all);
+    // 团内点相对最佳拟合平面的 RMS 残差（米）；点数不足返回 -1
+    float planeFitRms(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<uint32_t>& idxs) const;
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
@@ -204,12 +210,10 @@ private:
     // 横向边长 = base_xy × 分段倍率，再夹在 [base_xy, max_xy]
     std::vector<SizeXyBand> size_xy_bands_;
     std::string size_xy_bands_raw_;
-    // 纵向边长 = size_z_bands(r) × 线间距；bands 空则退回 size_z_ratio
     std::vector<SizeXyBand> size_z_bands_;
     std::string size_z_bands_raw_;
     double size_z_ratio_{4.0};
     double size_z_min_{0.1};
-    // thr_z = thr_ratio(r) × 线间距；参数名仍叫 thr_ratio，格式同 bands
     std::vector<SizeXyBand> thr_ratio_bands_;
     std::string thr_ratio_raw_;
     double thr_z_min_{0.03};
@@ -218,6 +222,10 @@ private:
     double cluster_plane_k_{10.0};
     // 删点后点聚类：团内点数少于此值则整团删除
     int min_cluster_points_{10};
+    // 平面拟合保护：连通团点数够且拟合残差小 → 不按 z 厚度删
+    bool enable_plane_protect_{true};
+    int plane_protect_min_points_{80};
+    double plane_protect_rms_m_{0.015};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;

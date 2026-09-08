@@ -67,7 +67,12 @@ cloud_passthrough_filter_node:
 
     min_cluster_points: 8
 
-    # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
+    # 平面拟合保护：连通团点数够且 RMS 残差小 → 不按 z 厚度删（删前保护）
+    enable_plane_protect: true
+    plane_protect_min_points: 80
+    plane_protect_rms_m: 0.015
+
+    # 红=删 青=平面保护留 绿=其它留 蓝=立方体无直通
     verdict_topic: "/vanjee/filter_verdict"
     boxes_topic: "/vanjee/filter_boxes"
     voxels_topic: "/vanjee/voxel_markers"

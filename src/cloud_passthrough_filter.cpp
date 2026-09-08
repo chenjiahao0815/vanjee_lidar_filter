@@ -15,6 +15,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <Eigen/Dense>
+
 #define PT_INFO(...) \
     do { if (shouldFrameLog()) { RCLCPP_INFO(this->get_logger(), __VA_ARGS__); } } while (0)
 #define PT_WARN(...) \
@@ -175,6 +177,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
     this->declare_parameter("min_cluster_points", 10);
+    this->declare_parameter("enable_plane_protect", true);
+    this->declare_parameter("plane_protect_min_points", 80);
+    this->declare_parameter("plane_protect_rms_m", 0.015);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -278,6 +283,15 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     min_cluster_points_ = this->get_parameter("min_cluster_points").as_int();
     if (min_cluster_points_ < 1) {
         min_cluster_points_ = 10;
+    }
+    enable_plane_protect_ = this->get_parameter("enable_plane_protect").as_bool();
+    plane_protect_min_points_ = this->get_parameter("plane_protect_min_points").as_int();
+    if (plane_protect_min_points_ < 3) {
+        plane_protect_min_points_ = 80;
+    }
+    plane_protect_rms_m_ = this->get_parameter("plane_protect_rms_m").as_double();
+    if (plane_protect_rms_m_ <= 0.0) {
+        plane_protect_rms_m_ = 0.015;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -415,7 +429,10 @@ void CloudPassthroughFilterNode::log_startup() const
                     thr_ratio_raw_.c_str(), thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 每格看厚度; 删后点聚类, 团点数<%d 则整团删",
+                    "  删点: 每格看厚度; 平面保护=%s (点数>=%d 且 RMS<=%.3fm); "
+                    "删后点聚类, 团点数<%d 则整团删",
+                    enable_plane_protect_ ? "开" : "关",
+                    plane_protect_min_points_, plane_protect_rms_m_,
                     min_cluster_points_);
         logVoxelScaleSamples();
     }
@@ -676,7 +693,7 @@ void CloudPassthroughFilterNode::cloud_callback(
         fine_grid_.clear();
         buildVoxelGrid(current);
         const size_t n_before_voxel = current->size();
-        bad_voxels = collectBadVoxels();
+        bad_voxels = collectBadVoxels(current);
         if (debug_mode_) {
             publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
         }
@@ -1242,25 +1259,87 @@ void CloudPassthroughFilterNode::assignClusters(std::vector<Voxel*>& all)
             next_id - 1, cluster_link_m_, cluster_link_k_, cluster_plane_k_);
 }
 
-std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
+std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud)
 {
     std::vector<Voxel*> all;
     all.reserve(grid_.size());
     for (auto& entry : grid_) {
+        entry.second.plane_protected = false;
         all.push_back(&entry.second);
     }
     assignClusters(all);
+
+    // 删前保护：连通团点数够且平面拟合残差小 → 整团不按厚度删
+    size_t protect_clusters = 0;
+    size_t protect_voxels = 0;
+    if (enable_plane_protect_ && cloud && !cloud->empty()) {
+        const uint32_t n_cloud = static_cast<uint32_t>(cloud->points.size());
+        std::unordered_map<int, std::vector<Voxel*>> by_cid;
+        by_cid.reserve(all.size());
+        for (Voxel* vp : all) {
+            if (vp->cluster_id > 0) {
+                by_cid[vp->cluster_id].push_back(vp);
+            }
+        }
+
+        auto try_protect = [&](std::vector<Voxel*>& voxs) {
+            std::vector<uint32_t> idxs;
+            idxs.reserve(256);
+            for (Voxel* v : voxs) {
+                for (uint32_t i : v->idx) {
+                    if (i < n_cloud) {
+                        idxs.push_back(i);
+                    }
+                }
+            }
+            if (static_cast<int>(idxs.size()) < plane_protect_min_points_) {
+                return;
+            }
+            const float rms = planeFitRms(cloud, idxs);
+            if (!(rms >= 0.0f) ||
+                static_cast<double>(rms) > plane_protect_rms_m_) {
+                return;
+            }
+            ++protect_clusters;
+            for (Voxel* v : voxs) {
+                if (!v->plane_protected) {
+                    v->plane_protected = true;
+                    ++protect_voxels;
+                }
+            }
+            PT_INFO("平面保护: t%d 点数=%zu rms=%.4fm → 整团不删",
+                    voxs.front()->cluster_id, idxs.size(), rms);
+        };
+
+        for (auto& entry : by_cid) {
+            try_protect(entry.second);
+        }
+        // 单格但点数够：也做拟合保护
+        for (Voxel* vp : all) {
+            if (vp->cluster_id != 0 || vp->plane_protected) {
+                continue;
+            }
+            std::vector<Voxel*> one{vp};
+            try_protect(one);
+        }
+    }
 
     std::vector<Voxel*> bad;
     bad.reserve(grid_.size());
 
     size_t thick_n = 0;
+    size_t protect_skip = 0;
     float sample_span = 0.0f;
     float sample_thr = 0.0f;
     bool have_sample = false;
 
     for (Voxel* vp : all) {
         Voxel& v = *vp;
+        if (v.plane_protected) {
+            ++protect_skip;
+            continue;
+        }
         const float span = v.zmax - v.zmin;
         if (span >= v.thr_z) {
             ++thick_n;
@@ -1274,12 +1353,77 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         }
     }
 
-    PT_INFO("坏体素判定: 总格 %zu, 厚留 %zu, 坏 %zu ",
-            grid_.size(), thick_n, bad.size());
+    PT_INFO("坏体素判定: 总格 %zu, 厚留 %zu, 平面保护格 %zu (团 %zu), 坏 %zu",
+            grid_.size(), thick_n, protect_skip, protect_clusters, bad.size());
     if (have_sample) {
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }
     return bad;
+}
+
+float CloudPassthroughFilterNode::planeFitRms(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<uint32_t>& idxs) const
+{
+    if (!cloud || idxs.size() < 3) {
+        return -1.0f;
+    }
+    const uint32_t n_cloud = static_cast<uint32_t>(cloud->points.size());
+    double sx = 0.0;
+    double sy = 0.0;
+    double sz = 0.0;
+    size_t n = 0;
+    for (uint32_t i : idxs) {
+        if (i >= n_cloud) {
+            continue;
+        }
+        const auto& p = cloud->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        sx += static_cast<double>(p.x);
+        sy += static_cast<double>(p.y);
+        sz += static_cast<double>(p.z);
+        ++n;
+    }
+    if (n < 3) {
+        return -1.0f;
+    }
+    const double inv = 1.0 / static_cast<double>(n);
+    const double cx = sx * inv;
+    const double cy = sy * inv;
+    const double cz = sz * inv;
+
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    for (uint32_t i : idxs) {
+        if (i >= n_cloud) {
+            continue;
+        }
+        const auto& p = cloud->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        const double dx = static_cast<double>(p.x) - cx;
+        const double dy = static_cast<double>(p.y) - cy;
+        const double dz = static_cast<double>(p.z) - cz;
+        cov(0, 0) += dx * dx;
+        cov(0, 1) += dx * dy;
+        cov(0, 2) += dx * dz;
+        cov(1, 1) += dy * dy;
+        cov(1, 2) += dy * dz;
+        cov(2, 2) += dz * dz;
+    }
+    cov(1, 0) = cov(0, 1);
+    cov(2, 0) = cov(0, 2);
+    cov(2, 1) = cov(1, 2);
+    cov *= inv;
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+    if (es.info() != Eigen::Success) {
+        return -1.0f;
+    }
+    const double lambda0 = std::max(0.0, es.eigenvalues()(0));
+    return static_cast<float>(std::sqrt(lambda0));
 }
 
 void CloudPassthroughFilterNode::removePointsInBadVoxels(
@@ -1629,9 +1773,27 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         }
     }
 
-    // 1) 三种颜色：红=删，绿=留下，蓝=立方体内但没进直通
+    std::unordered_set<uint64_t> protect_keys;
+    protect_keys.reserve(256);
+    if (n_pass > 0) {
+        for (const auto& entry : grid_) {
+            const Voxel& v = entry.second;
+            if (!v.plane_protected) {
+                continue;
+            }
+            for (uint32_t idx : v.idx) {
+                if (idx < n_pass) {
+                    const auto& p = pass_cloud->points[idx];
+                    protect_keys.insert(pack_key(p.x, p.y, p.z));
+                }
+            }
+        }
+    }
+
+    // 1) 红=删，青=平面保护留下，绿=其它留下，蓝=立方体内但没进直通
     size_t n_del = 0;
     size_t n_keep = 0;
+    size_t n_fit = 0;
     size_t n_blue = 0;
     if (verdict_publisher_ && raw_cloud && !raw_cloud->empty()) {
         const uint32_t n_raw = static_cast<uint32_t>(raw_cloud->points.size());
@@ -1641,6 +1803,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         color.reserve(n_raw);
         const uint32_t c_del = packRgb(240, 40, 40);
         const uint32_t c_keep = packRgb(40, 220, 80);
+        const uint32_t c_fit = packRgb(40, 220, 220);
         const uint32_t c_blue = packRgb(40, 110, 255);
 
         for (uint32_t i = 0; i < n_raw; ++i) {
@@ -1652,10 +1815,15 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                 color.push_back(c_blue);
                 ++n_blue;
             } else if (cube && pass) {
-                if (deleted_keys.count(pack_key(p.x, p.y, p.z)) != 0) {
+                const uint64_t key = pack_key(p.x, p.y, p.z);
+                if (deleted_keys.count(key) != 0) {
                     pick.push_back(i);
                     color.push_back(c_del);
                     ++n_del;
+                } else if (protect_keys.count(key) != 0) {
+                    pick.push_back(i);
+                    color.push_back(c_fit);
+                    ++n_fit;
                 } else {
                     pick.push_back(i);
                     color.push_back(c_keep);
@@ -1803,6 +1971,11 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                 cube.color.g = 0.2f;
                 cube.color.b = 0.2f;
                 cube.color.a = 0.28f;
+            } else if (v.plane_protected) {
+                cube.color.r = 0.15f;
+                cube.color.g = 0.85f;
+                cube.color.b = 0.9f;
+                cube.color.a = 0.32f;
             } else {
                 cube.color.r = 0.2f;
                 cube.color.g = 0.85f;
@@ -1826,11 +1999,19 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             text.color.g = 1.0f;
             text.color.b = 0.85f;
             text.color.a = 1.0f;
-            char buf[128];
+            char buf[144];
             const float zspan = v.zmax - v.zmin;
             const double xy_r = lookupSizeXyRatio(static_cast<double>(v.r));
             const double z_r = lookupSizeZRatio(static_cast<double>(v.r));
-            if (v.cluster_id > 0) {
+            if (v.plane_protected && v.cluster_id > 0) {
+                std::snprintf(buf, sizeof(buf),
+                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,t%d,fit",
+                              xy_r, z_r, zspan, v.thr_z, v.cluster_id);
+            } else if (v.plane_protected) {
+                std::snprintf(buf, sizeof(buf),
+                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,fit",
+                              xy_r, z_r, zspan, v.thr_z);
+            } else if (v.cluster_id > 0) {
                 std::snprintf(buf, sizeof(buf),
                               "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,t%d",
                               xy_r, z_r, zspan, v.thr_z, v.cluster_id);
@@ -1886,9 +2067,9 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         if (voxels_kept_publisher_) {
             voxels_kept_publisher_->publish(arr_keep);
         }
-        PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝(立方体无直通) %zu "
+        PT_INFO("调试可视化: 红删 %zu 青平面保护 %zu 绿留 %zu 蓝(立方体无直通) %zu "
                 "体素合并 %zu 删格话题 %zu 留格话题 %zu / 总格 %zu",
-                n_del, n_keep, n_blue, drawn, drawn_del, drawn_keep, grid_.size());
+                n_del, n_fit, n_keep, n_blue, drawn, drawn_del, drawn_keep, grid_.size());
     }
 }
 
