@@ -55,6 +55,12 @@ struct VoxelScale {
     double inv_z{0.0};
 };
 
+// XY 分段倍率
+struct SizeXyBand {
+    double split_r{0.0};
+    double ratio{1.0};
+};
+
 struct Voxel {
     int ix{0};
     int iy{0};
@@ -72,9 +78,8 @@ struct Voxel {
     int merge_nz{1};
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
-    int cluster_id{0};  // 连通团编号，0=未成团/单格；只给整团扫用，不保护
+    int cluster_id{0};  // 连通团编号，0=未成团/单格；可视化/日志用
     int cell_id{0};     // 本帧体素格子编号，可视化/删点日志对照用
-    bool wiped_by_cluster{false};  // 因整团扫被连带删掉
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -113,6 +118,8 @@ private:
 
     void logVoxelScaleSamples() const;
     VoxelScale computeVoxelScale(double r) const;
+    bool parseSizeXyBands(const std::string& text, std::vector<SizeXyBand>& out) const;
+    double lookupSizeXyRatio(double r_xy) const;
     bool inOurCube(float x, float y, float z) const;
     bool inPassthrough(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
@@ -123,6 +130,10 @@ private:
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
+        const std_msgs::msg::Header& header);
+    // 体素删点后：对剩余点再聚类，点数 < min_cluster_points_ 的整团删掉
+    void removeSmallPointClusters(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std_msgs::msg::Header& header);
     void publishFilterDebug(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& raw_cloud,
@@ -170,10 +181,13 @@ private:
     bool frame_log_enabled_{false};
     std::chrono::steady_clock::time_point last_cloud_log_time_{};
 
-    // 我们自己的立方体，和直通滤波无关；以雷达原点为中心，长宽高是参数
-    double cube_length_{4.0};
-    double cube_width_{4.0};
-    double cube_height_{2.0};
+    // 我们自己的立方体，和直通滤波无关；按轴 min/max，可不对称
+    double cube_min_x_{-2.0};
+    double cube_max_x_{2.0};
+    double cube_min_y_{-2.0};
+    double cube_max_y_{2.0};
+    double cube_min_z_{-1.0};
+    double cube_max_z_{1.0};
 
     // 体素参数：边长 = 默认值 × 整数倍率；倍率由距离×角分辨率相对默认值向上取整
     double ang_h_{0.0};
@@ -183,8 +197,9 @@ private:
     double base_z_{0.01};
     double max_xy_{0.5};
     double max_z_{0.5};
-    // 横向边长 = size_xy_ratio × 线间距，再夹在 [base_xy, max_xy]
-    double size_xy_ratio_{1.0};
+    // 横向边长 = base_xy × 分段倍率，再夹在 [base_xy, max_xy]
+    std::vector<SizeXyBand> size_xy_bands_;
+    std::string size_xy_bands_raw_;
     // 纵向边长 = size_z_ratio × 线间距，再夹在 [size_z_min, max_z]
     double size_z_ratio_{4.0};
     double size_z_min_{0.1};
@@ -193,8 +208,8 @@ private:
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
-    // 编号团里坏格占比 ≥ 此值，整团扫光（别留几颗孤点）
-    double cluster_wipe_ratio_{0.7};
+    // 删点后点聚类：团内点数少于此值则整团删除
+    int min_cluster_points_{10};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;
