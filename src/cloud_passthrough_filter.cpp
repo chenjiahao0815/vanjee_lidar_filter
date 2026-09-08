@@ -433,7 +433,7 @@ void CloudPassthroughFilterNode::updateFrameLogGate()
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        const double elapsed_sec = 
+        const double elapsed_sec =
             std::chrono::duration<double>(now - last_cloud_log_time_).count();
         if (cloud_log_interval_sec_ <= 0.0 || elapsed_sec >= cloud_log_interval_sec_) {
             frame_log_enabled_ = true;
@@ -583,7 +583,7 @@ CloudPassthroughFilterNode::passthrough_filter_cpu(
                 filtered->points.push_back(p);
                 if (track_ring) {
                     ring_scratch_.push_back(ring_of_cur_[i]);
-                }
+            }
             }
         }
         if (track_ring) {
