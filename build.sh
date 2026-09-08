@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 编译 vanjee_lidar_filter，并在当前 shell 里 source。
-# 用法（必须 source，否则环境不会留在当前终端）：
+# ros2 bag play /home/linux/vehicle_total/vajee_lidar/wanjee_bag/vanjee_noise_motion_20260902_143028 --clock --rate 0.5 --loop
 #   source /home/linux/ros_cpp/vanjee_lidar_filter/build.sh
 #   或source ./build.sh
 

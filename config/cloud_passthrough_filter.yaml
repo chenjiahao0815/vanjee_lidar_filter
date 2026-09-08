@@ -34,7 +34,7 @@ cloud_passthrough_filter_node:
     memory_pool_reserve: 1000000
     cloud_log_interval_sec: 1.0
 
-    # 立方体（体素 ROI，按轴 min/max，可不对称）
+    # 立方体
     cube_min_x: -2.5
     cube_max_x: 2.5
     cube_min_y: -2.5
@@ -48,23 +48,24 @@ cloud_passthrough_filter_node:
     ang_v: 0.0174532925
     r_max: 8.0
     base_xy: 0.05
-    base_z: 0.1
+    base_z: 0.05
     max_xy: 1.0
     max_z: 1.0
-    size_z_min: 0.1
+    size_z_min: 0.05
 
-    size_xy_bands: "(1.0,4.0),(2.0,6.0),(3.5,8.0)"
-    size_z_ratio: 10.0
+    # r<1 ×1；[1,2)×2；[2,3.5)×3；≥3.5 ×4
+    size_xy_bands: "(1.0,2.0),(2.0,3.0),(3.5,4.0)"
+    size_z_ratio: 4.0
 
-    thr_ratio: 1.5   # 越大删得越多
-    thr_z_min: 0.05
+    thr_ratio: 2.0   # 越大删得越多
+    thr_z_min: 0.07
 
     # 聚类
     cluster_link_m: 0.18
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
 
-    min_cluster_points: 10
+    min_cluster_points: 8
 
     # 红=体素删掉 绿=两框交集里留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"

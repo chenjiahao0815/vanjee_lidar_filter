@@ -804,7 +804,7 @@ bool CloudPassthroughFilterNode::parseSizeXyBands(
             return false;
         }
         ++i;
-        if (!(split_r > 0.0) || !(ratio > 0.0)) {
+        if (!(split_r >= 0.0) || !(ratio > 0.0)) {
             return false;
         }
         out.push_back(SizeXyBand{split_r, ratio});
@@ -839,12 +839,16 @@ double CloudPassthroughFilterNode::lookupSizeXyRatio(double r_xy) const
         return 1.0;
     }
     const double r = std::max(r_xy, 0.0);
+    // (起始距离, 倍率)：取最后一个 split_r ≤ r 的段；比第一段还近 → 不扩大
+    double ratio = 1.0;
     for (const auto& band : size_xy_bands_) {
-        if (r <= band.split_r) {
-            return band.ratio;
+        if (r >= band.split_r) {
+            ratio = band.ratio;
+        } else {
+            break;
         }
     }
-    return size_xy_bands_.back().ratio;
+    return ratio;
 }
 
 bool CloudPassthroughFilterNode::inOurCube(float x, float y, float z) const
@@ -979,45 +983,43 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
             }
         }
 
-        const int cx = floorDiv(fine.ix, n.nxy);
-        const int cy = floorDiv(fine.iy, n.nxy);
-        const int cz = floorDiv(fine.iz, n.nz);
-        const int64_t ckey = makeKey(cx, cy, cz);
+        const int nxy = std::max(1, n.nxy);
+        const int nz = std::max(1, n.nz);
+        // 键用细格角点，不是 floor(ix/n)；后者不同倍率会撞成同一格
+        const int origin_ix = floorDiv(fine.ix, nxy) * nxy;
+        const int origin_iy = floorDiv(fine.iy, nxy) * nxy;
+        const int origin_iz = floorDiv(fine.iz, nz) * nz;
+        const int64_t ckey = makeCoarseKey(origin_ix, origin_iy, origin_iz, nxy, nz);
 
-        const double center_x = (static_cast<double>(fine.ix) + 0.5) * base_xy_;
-        const double center_y = (static_cast<double>(fine.iy) + 0.5) * base_xy_;
-        const float cell_r = static_cast<float>(std::hypot(center_x, center_y));
+        const double cell_sx_d = std::min(base_xy_ * static_cast<double>(nxy), max_xy_);
+        const double cell_sz_d = std::min(base_z_ * static_cast<double>(nz), max_z_);
+        const float cell_sx = static_cast<float>(std::max(cell_sx_d, base_xy_));
+        const float cell_sz = static_cast<float>(std::max(cell_sz_d, base_z_));
+        const double cube_cx = static_cast<double>(origin_ix) * base_xy_ + 0.5 * cell_sx_d;
+        const double cube_cy = static_cast<double>(origin_iy) * base_xy_ + 0.5 * cell_sx_d;
+        const float cell_r = static_cast<float>(std::hypot(cube_cx, cube_cy));
 
         auto it = grid_.find(ckey);
         if (it == grid_.end()) {
             Voxel v;
-            v.ix = cx;
-            v.iy = cy;
-            v.iz = cz;
+            v.ix = origin_ix;
+            v.iy = origin_iy;
+            v.iz = origin_iz;
             v.count = fine.count;
             v.zmin = fine.zmin;
             v.zmax = fine.zmax;
             v.r = cell_r;
-            v.cx = static_cast<float>(center_x);
-            v.cy = static_cast<float>(center_y);
+            v.cx = static_cast<float>(cube_cx);
+            v.cy = static_cast<float>(cube_cy);
+            v.cell_sx = cell_sx;
+            v.cell_sz = cell_sz;
             v.ring_mask = fine.ring_mask;
             v.idx = fine.idx;
-            v.merge_nxy = std::max(1, n.nxy);
-            v.merge_nz = std::max(1, n.nz);
+            v.merge_nxy = nxy;
+            v.merge_nz = nz;
             grid_.emplace(ckey, std::move(v));
         } else {
             Voxel& v = it->second;
-            if (n.nxy > v.merge_nxy) {
-                v.merge_nxy = n.nxy;
-            }
-            if (n.nz > v.merge_nz) {
-                v.merge_nz = n.nz;
-            }
-            const double w_old = static_cast<double>(v.count);
-            const double w_new = static_cast<double>(fine.count);
-            const double w = std::max(w_old + w_new, 1.0);
-            v.cx = static_cast<float>((static_cast<double>(v.cx) * w_old + center_x * w_new) / w);
-            v.cy = static_cast<float>((static_cast<double>(v.cy) * w_old + center_y * w_new) / w);
             v.count += fine.count;
             if (fine.zmin < v.zmin) {
                 v.zmin = fine.zmin;
@@ -1058,6 +1060,18 @@ int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
     const int64_t uy = static_cast<int64_t>(iy) + kOffset;
     const int64_t uz = static_cast<int64_t>(iz) + kOffset;
     return (ux << 40) | (uy << 20) | uz;
+}
+
+int64_t CloudPassthroughFilterNode::makeCoarseKey(
+    int ox, int oy, int oz, int nxy, int nz) const
+{
+    constexpr int64_t kOff = 1 << 15;
+    const int64_t ux = static_cast<int64_t>(ox) + kOff;
+    const int64_t uy = static_cast<int64_t>(oy) + kOff;
+    const int64_t uz = static_cast<int64_t>(oz) + kOff;
+    const int64_t nx = static_cast<int64_t>(std::max(1, std::min(nxy, 255)));
+    const int64_t nzv = static_cast<int64_t>(std::max(1, std::min(nz, 255)));
+    return (ux << 48) | (uy << 32) | (uz << 16) | (nx << 8) | nzv;
 }
 
 int CloudPassthroughFilterNode::ringId(float x, float y, float z) const
@@ -1704,23 +1718,21 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             push_clear(arr_keep, "kept_voxels");
         }
 
-        constexpr size_t kMaxVoxels = 2500;
         size_t drawn = 0;
         size_t drawn_del = 0;
         size_t drawn_keep = 0;
-        int cube_id = 10;
-        int text_id = 10000;
+        int marker_id = 1;
 
         auto append_voxel = [&](visualization_msgs::msg::MarkerArray& arr,
                                 const char* ns,
                                 bool is_bad,
                                 double cx, double cy, double cz,
-                                double sx, double sz, double zmin,
+                                double sx, double sy, double sz, double z_top,
                                 const Voxel& v) {
             visualization_msgs::msg::Marker cube;
             cube.header = header;
             cube.ns = ns;
-            cube.id = cube_id++;
+            cube.id = marker_id++;
             cube.type = visualization_msgs::msg::Marker::CUBE;
             cube.action = visualization_msgs::msg::Marker::ADD;
             cube.pose.orientation.w = 1.0;
@@ -1728,7 +1740,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             cube.pose.position.y = cy;
             cube.pose.position.z = cz;
             cube.scale.x = sx;
-            cube.scale.y = sx;
+            cube.scale.y = sy;
             cube.scale.z = sz;
             if (is_bad) {
                 cube.color.r = 0.95f;
@@ -1746,13 +1758,13 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             visualization_msgs::msg::Marker text;
             text.header = header;
             text.ns = ns;
-            text.id = text_id++;
+            text.id = marker_id++;
             text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
             text.action = visualization_msgs::msg::Marker::ADD;
             text.pose.orientation.w = 1.0;
             text.pose.position.x = cx;
             text.pose.position.y = cy;
-            text.pose.position.z = zmin + sz + 0.03;
+            text.pose.position.z = z_top + 0.03;
             text.scale.z = 0.018;
             text.color.r = 1.0f;
             text.color.g = 1.0f;
@@ -1772,31 +1784,34 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         };
 
         for (const auto& entry : grid_) {
-            if (drawn >= kMaxVoxels) {
-                break;
-            }
             const Voxel& v = entry.second;
-            const double sx = std::max(base_xy_ * static_cast<double>(std::max(v.merge_nxy, 1)),
-                                      base_xy_);
-            const double sz = std::max(base_z_ * static_cast<double>(std::max(v.merge_nz, 1)),
-                                      base_z_);
-            const double xmin = static_cast<double>(v.ix) * sx;
-            const double ymin = static_cast<double>(v.iy) * sx;
-            const double zmin = static_cast<double>(v.iz) * sz;
-            const double cx = xmin + 0.5 * sx;
-            const double cy = ymin + 0.5 * sx;
-            const double cz = zmin + 0.5 * sz;
+            if (v.count == 0 || v.idx.empty()) {
+                continue;
+            }
+            // 画合并后的那一格：边长 = n×base，夹在 max_xy/max_z 内
+            const double sx = std::min(
+                std::max(static_cast<double>(v.cell_sx), base_xy_), max_xy_);
+            const double sy = sx;
+            const double sz = std::min(
+                std::max(static_cast<double>(v.cell_sz), base_z_), max_z_);
+            const double cx = static_cast<double>(v.ix) * base_xy_ + 0.5 * sx;
+            const double cy = static_cast<double>(v.iy) * base_xy_ + 0.5 * sy;
+            const double cz = static_cast<double>(v.iz) * base_z_ + 0.5 * sz;
+            const double z_top = cz + 0.5 * sz;
             const bool is_bad = bad_set.count(&v) != 0;
 
             if (voxels_publisher_) {
-                append_voxel(arr_all, "occupied_voxels", is_bad, cx, cy, cz, sx, sz, zmin, v);
+                append_voxel(arr_all, "occupied_voxels", is_bad,
+                             cx, cy, cz, sx, sy, sz, z_top, v);
             }
             if (is_bad && voxels_deleted_publisher_) {
-                append_voxel(arr_del, "deleted_voxels", true, cx, cy, cz, sx, sz, zmin, v);
+                append_voxel(arr_del, "deleted_voxels", true,
+                             cx, cy, cz, sx, sy, sz, z_top, v);
                 ++drawn_del;
             }
             if (!is_bad && voxels_kept_publisher_) {
-                append_voxel(arr_keep, "kept_voxels", false, cx, cy, cz, sx, sz, zmin, v);
+                append_voxel(arr_keep, "kept_voxels", false,
+                             cx, cy, cz, sx, sy, sz, z_top, v);
                 ++drawn_keep;
             }
             ++drawn;

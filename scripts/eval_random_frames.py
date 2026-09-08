@@ -26,8 +26,9 @@ import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2
 
 ANG_V = 0.0174532925
-LIM = dict(x=(-2.0, 2.0), y=(-2.0, 2.0), z=(-1.0, 1.0))
-CUBE = (2.0, 2.0, 1.0)  # half L/W/H of 4x4x2
+# 与 config/cloud_passthrough_filter.yaml 对齐
+LIM = dict(x=(-8.0, 8.0), y=(-8.0, 8.0), z=(-2.0, 2.0))
+CUBE = dict(x=(-2.5, 2.5), y=(-2.5, 2.5), z=(-1.0, 1.0))
 CLUSTER_G = 0.12
 
 
@@ -105,7 +106,9 @@ def in_pass(p):
 
 
 def in_cube(p):
-    return abs(p[0]) <= CUBE[0] and abs(p[1]) <= CUBE[1] and abs(p[2]) <= CUBE[2]
+    return (CUBE["x"][0] <= p[0] <= CUBE["x"][1]
+            and CUBE["y"][0] <= p[1] <= CUBE["y"][1]
+            and CUBE["z"][0] <= p[2] <= CUBE["z"][1])
 
 
 def clusters(P: np.ndarray, RG: np.ndarray, g: float = CLUSTER_G):
@@ -169,7 +172,13 @@ def start_node(params_file: str, domain: str) -> subprocess.Popen:
         "-p", "debug_topic_y:=/eval/py",
         "-p", "debug_topic_z:=/eval/pz",
         "-p", "debug_mode:=true",
-        "-r", "__node:=cloud_passthrough_eval",
+        "-p", "publish_occupied_voxels:=false",
+        "-p", "verdict_topic:=/eval/verdict",
+        "-p", "boxes_topic:=/eval/boxes",
+        "-p", "voxels_topic:=/eval/voxels",
+        "-p", "voxels_deleted_topic:=/eval/voxels_del",
+        "-p", "voxels_kept_topic:=/eval/voxels_keep",
+        "-r", "__ns:=/",
     ]
     return subprocess.Popen(
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
@@ -202,7 +211,7 @@ def main():
     from rclpy.node import Node as RclNode
 
     qos = QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
+        reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
         depth=5,
@@ -253,7 +262,7 @@ def main():
             got_k = got_r = False
             kept_msg = rem_msg = None
             published = 1
-            while time.time() - t0 < 6.0:
+            while time.time() - t0 < 12.0:
                 rclpy.spin_once(node, timeout_sec=0.05)
                 for m in kept_box:
                     if stamp_key(m) == key:
@@ -265,7 +274,7 @@ def main():
                         got_r = True
                 if got_k and (got_r or time.time() - t0 > 0.8):
                     break
-                if (not got_k) and time.time() - t0 > 1.2 * published:
+                if (not got_k) and time.time() - t0 > 2.0 * published:
                     pub.publish(msg)
                     published += 1
             if not got_k:

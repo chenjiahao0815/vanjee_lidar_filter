@@ -74,7 +74,9 @@ struct Voxel {
     float cy{0.0f};
     float size_xy{0.0f};
     float size_z{0.0f};
-    int merge_nxy{1};  // 合进本格时用的横向倍率，画框必须跟这个走
+    float cell_sx{0.0f};
+    float cell_sz{0.0f};
+    int merge_nxy{1};  // 合进本格时用的横向倍率
     int merge_nz{1};
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
@@ -141,6 +143,7 @@ private:
         const std::vector<Voxel*>& bad_voxels,
         const std_msgs::msg::Header& header);
     int64_t makeKey(int ix, int iy, int iz) const;
+    int64_t makeCoarseKey(int ox, int oy, int oz, int nxy, int nz) const;
     int floorDiv(int a, int b) const;
     int ringId(float x, float y, float z) const;
     // 优先用 ring_of_cur_[i] 里的真实线号，缺失时退回 atan2 几何估计
@@ -181,7 +184,6 @@ private:
     bool frame_log_enabled_{false};
     std::chrono::steady_clock::time_point last_cloud_log_time_{};
 
-    // 我们自己的立方体，和直通滤波无关；按轴 min/max，可不对称
     double cube_min_x_{-2.0};
     double cube_max_x_{2.0};
     double cube_min_y_{-2.0};
