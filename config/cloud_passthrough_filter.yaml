@@ -49,16 +49,16 @@ cloud_passthrough_filter_node:
     r_max: 8.0
     base_xy: 0.05
     base_z: 0.05
-    max_xy: 1.0
-    max_z: 1.0
+    max_xy: 2.0
+    max_z: 2.0
     size_z_min: 0.05
 
-    # r<1 ×1；[1,2)×2；[2,3.5)×3；≥3.5 ×4
-    size_xy_bands: "(1.0,2.0),(2.0,3.0),(3.5,4.0)"
+    size_xy_bands: "(1.0,4.0),(2.0,6.0),(3.0,10.0)"
+    size_z_bands: "(0.0,3.0),(1.0,4.0),(2.0,8.0),(3.0,12.0)"
     size_z_ratio: 4.0
 
-    thr_ratio: 2.0   # 越大删得越多
-    thr_z_min: 0.07
+    thr_ratio: "(0.0,1.0),(1.0,2.0)"  # 越大删得越多  thr_z = line_gap x thr_ratio
+    thr_z_min: 0.05
 
     # 聚类
     cluster_link_m: 0.18

@@ -165,9 +165,11 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("max_z", 0.5);
     this->declare_parameter(
         "size_xy_bands", std::string("(1.0,4.0),(2.0,6.0),(3.5,8.0)"));
+    this->declare_parameter(
+        "size_z_bands", std::string("(1.0,3.0),(2.0,4.0),(3.0,5.0)"));
     this->declare_parameter("size_z_ratio", 4.0);
     this->declare_parameter("size_z_min", 0.1);
-    this->declare_parameter("thr_ratio", 0.5);
+    this->declare_parameter("thr_ratio", std::string("(0.0,2.0)"));
     this->declare_parameter("thr_z_min", 0.03);
     this->declare_parameter("cluster_link_m", 0.18);
     this->declare_parameter("cluster_link_k", 6.0);
@@ -232,6 +234,15 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
         size_xy_bands_.clear();
         size_xy_bands_.push_back(SizeXyBand{1.0e9, 1.0});
     }
+    size_z_bands_raw_ = this->get_parameter("size_z_bands").as_string();
+    size_z_bands_.clear();
+    if (!size_z_bands_raw_.empty() &&
+        !parseSizeXyBands(size_z_bands_raw_, size_z_bands_)) {
+        RCLCPP_WARN(this->get_logger(),
+                    "size_z_bands 解析失败: '%s'，退回 size_z_ratio",
+                    size_z_bands_raw_.c_str());
+        size_z_bands_.clear();
+    }
     size_z_ratio_ = this->get_parameter("size_z_ratio").as_double();
     if (size_z_ratio_ <= 0.0) {
         size_z_ratio_ = 4.0;
@@ -240,7 +251,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (size_z_min_ <= 0.0) {
         size_z_min_ = 0.1;
     }
-    thr_ratio_ = this->get_parameter("thr_ratio").as_double();
+    thr_ratio_raw_ = this->get_parameter("thr_ratio").as_string();
+    if (!parseSizeXyBands(thr_ratio_raw_, thr_ratio_bands_)) {
+        RCLCPP_WARN(this->get_logger(),
+                    "thr_ratio 解析失败: '%s'，退回全程倍率 2.0",
+                    thr_ratio_raw_.c_str());
+        thr_ratio_bands_.clear();
+        thr_ratio_bands_.push_back(SizeXyBand{0.0, 2.0});
+    }
     thr_z_min_ = this->get_parameter("thr_z_min").as_double();
     if (thr_z_min_ < 0.0) {
         thr_z_min_ = 0.0;
@@ -386,13 +404,15 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_min_z_, cube_max_z_);
         RCLCPP_INFO(this->get_logger(),
                     "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向 bands=%s 夹[%.3f,%.3f] 纵向=%.1f×线间距夹[%.3f,%.3f], "
-                    "thr_ratio=%.2f thr_z_min=%.3f, "
+                    "横向 bands=%s 夹[%.3f,%.3f] "
+                    "纵向 bands=%s (空则×%.1f) ×线间距夹[%.3f,%.3f], "
+                    "thr_ratio=%s thr_z_min=%.3f, "
                     "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
                     ang_h_, ang_v_, base_xy_, base_z_,
                     size_xy_bands_raw_.c_str(), base_xy_, max_xy_,
-                    size_z_ratio_, size_z_min_, max_z_,
-                    thr_ratio_, thr_z_min_,
+                    size_z_bands_raw_.c_str(), size_z_ratio_,
+                    size_z_min_, max_z_,
+                    thr_ratio_raw_.c_str(), thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
                     "  删点: 每格看厚度; 删后点聚类, 团点数<%d 则整团删",
@@ -691,10 +711,10 @@ void CloudPassthroughFilterNode::logVoxelScaleSamples() const
     for (double r : samples) {
         const VoxelScale s = computeVoxelScale(r);
         RCLCPP_INFO(this->get_logger(),
-                    "  样例 r=%.1f xy_ratio=%.2f line_gap=%.4f mult_xy=%d mult_z=%d "
-                    "size_xy=%.3f size_z=%.3f thr_z=%.4f",
-                    r, lookupSizeXyRatio(r), s.line_gap, s.mult_xy, s.mult_z,
-                    s.size_xy, s.size_z, s.thr_z);
+                    "  样例 r=%.1f xy_ratio=%.2f z_ratio=%.2f thr_ratio=%.2f "
+                    "line_gap=%.4f mult_xy=%d mult_z=%d size_xy=%.3f size_z=%.3f thr_z=%.4f",
+                    r, lookupSizeXyRatio(r), lookupSizeZRatio(r), lookupThrRatio(r),
+                    s.line_gap, s.mult_xy, s.mult_z, s.size_xy, s.size_z, s.thr_z);
     }
 }
 
@@ -708,14 +728,15 @@ VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
     s.line_gap = rr * ang_v_;
     s.pt_gap = s.line_gap;
     const double xy_ratio = lookupSizeXyRatio(rr);
+    const double z_ratio = lookupSizeZRatio(rr);
     s.size_xy = std::min(std::max(base_xy * xy_ratio, base_xy), max_xy_);
-    s.size_z = std::min(std::max(size_z_ratio_ * s.line_gap, size_z_min_), max_z_);
+    s.size_z = std::min(std::max(z_ratio * s.line_gap, size_z_min_), max_z_);
     s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy - 1e-12)));
     s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z - 1e-12)));
     s.size_xy = std::min(base_xy * static_cast<double>(s.mult_xy), max_xy_);
     s.size_z = std::min(base_z * static_cast<double>(s.mult_z), max_z_);
 
-    s.thr_z = s.line_gap * thr_ratio_;
+    s.thr_z = s.line_gap * lookupThrRatio(rr);
     if (s.thr_z < thr_z_min_) {
         s.thr_z = thr_z_min_;
     }
@@ -842,6 +863,41 @@ double CloudPassthroughFilterNode::lookupSizeXyRatio(double r_xy) const
     // (起始距离, 倍率)：取最后一个 split_r ≤ r 的段；比第一段还近 → 不扩大
     double ratio = 1.0;
     for (const auto& band : size_xy_bands_) {
+        if (r >= band.split_r) {
+            ratio = band.ratio;
+        } else {
+            break;
+        }
+    }
+    return ratio;
+}
+
+double CloudPassthroughFilterNode::lookupSizeZRatio(double r_xy) const
+{
+    // bands 空：退回常数 size_z_ratio；有 bands：与 XY 相同分段语义
+    if (size_z_bands_.empty()) {
+        return size_z_ratio_;
+    }
+    const double r = std::max(r_xy, 0.0);
+    double ratio = 1.0;
+    for (const auto& band : size_z_bands_) {
+        if (r >= band.split_r) {
+            ratio = band.ratio;
+        } else {
+            break;
+        }
+    }
+    return ratio;
+}
+
+double CloudPassthroughFilterNode::lookupThrRatio(double r_xy) const
+{
+    if (thr_ratio_bands_.empty()) {
+        return 2.0;
+    }
+    const double r = std::max(r_xy, 0.0);
+    double ratio = 1.0;
+    for (const auto& band : thr_ratio_bands_) {
         if (r >= band.split_r) {
             ratio = band.ratio;
         } else {
@@ -1770,14 +1826,18 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             text.color.g = 1.0f;
             text.color.b = 0.85f;
             text.color.a = 1.0f;
-            char buf[112];
+            char buf[128];
             const float zspan = v.zmax - v.zmin;
+            const double xy_r = lookupSizeXyRatio(static_cast<double>(v.r));
+            const double z_r = lookupSizeZRatio(static_cast<double>(v.r));
             if (v.cluster_id > 0) {
-                std::snprintf(buf, sizeof(buf), "z:%.2f,span:%.2f,thr:%.2f,t%d,#%d",
-                              cz, zspan, v.thr_z, v.cluster_id, v.cell_id);
+                std::snprintf(buf, sizeof(buf),
+                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,t%d",
+                              xy_r, z_r, zspan, v.thr_z, v.cluster_id);
             } else {
-                std::snprintf(buf, sizeof(buf), "z:%.2f,span:%.2f,thr:%.2f,#%d",
-                              cz, zspan, v.thr_z, v.cell_id);
+                std::snprintf(buf, sizeof(buf),
+                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f",
+                              xy_r, z_r, zspan, v.thr_z);
             }
             text.text = buf;
             arr.markers.push_back(text);

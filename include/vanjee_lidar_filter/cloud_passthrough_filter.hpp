@@ -122,6 +122,8 @@ private:
     VoxelScale computeVoxelScale(double r) const;
     bool parseSizeXyBands(const std::string& text, std::vector<SizeXyBand>& out) const;
     double lookupSizeXyRatio(double r_xy) const;
+    double lookupSizeZRatio(double r_xy) const;
+    double lookupThrRatio(double r_xy) const;
     bool inOurCube(float x, float y, float z) const;
     bool inPassthrough(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
@@ -202,10 +204,14 @@ private:
     // 横向边长 = base_xy × 分段倍率，再夹在 [base_xy, max_xy]
     std::vector<SizeXyBand> size_xy_bands_;
     std::string size_xy_bands_raw_;
-    // 纵向边长 = size_z_ratio × 线间距，再夹在 [size_z_min, max_z]
+    // 纵向边长 = size_z_bands(r) × 线间距；bands 空则退回 size_z_ratio
+    std::vector<SizeXyBand> size_z_bands_;
+    std::string size_z_bands_raw_;
     double size_z_ratio_{4.0};
     double size_z_min_{0.1};
-    double thr_ratio_{0.5};
+    // thr_z = thr_ratio(r) × 线间距；参数名仍叫 thr_ratio，格式同 bands
+    std::vector<SizeXyBand> thr_ratio_bands_;
+    std::string thr_ratio_raw_;
     double thr_z_min_{0.03};
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
