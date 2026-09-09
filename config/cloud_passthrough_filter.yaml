@@ -66,11 +66,19 @@ cloud_passthrough_filter_node:
     cluster_plane_k: 10.0
 
     min_cluster_points: 8
+    # 体素删点后的小团清扫：对剩余点再聚类删碎片；很慢，默认关
+    enable_small_cluster_filter: false
 
-    # 平面拟合保护：连通团点数够且 RMS 残差小 → 不按 z 厚度删（删前保护）
+    # 平面拟合保护
     enable_plane_protect: true
-    plane_protect_min_points: 80
-    plane_protect_rms_m: 0.015
+    plane_protect_min_points: 80   # 越小越留
+    plane_protect_rms_m: 0.015  # 越小越删
+
+    plane_protect_intensity: 10.0  # 团强度中位低于此值 → 不给豁免
+    # 水平薄片否决豁免：|nz|>=此值 且 覆盖线数<=此值 → 当 pancake，回落厚度规则
+    plane_protect_nz_min: 0.6
+    plane_protect_max_rings: 10  # 越大越删  车
+
 
     # 红=删 青=平面保护留 绿=其它留 蓝=立方体无直通
     verdict_topic: "/vanjee/filter_verdict"

@@ -101,6 +101,10 @@ private:
     void removeNonFinitePointsInPlace(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud);
     // 从原始消息里取真实线号；没有 ring 字段时返回 false，退回几何估计
     bool loadRingField(const sensor_msgs::msg::PointCloud2& msg);
+    // 从原始消息里取 intensity；没有该字段时返回 false
+    bool loadIntensityField(const sensor_msgs::msg::PointCloud2& msg);
+    // 团内强度中位数；无强度或点数不足返回 -1
+    float clusterIntensityMedian(const std::vector<uint32_t>& idxs) const;
     void publish_cloud(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std_msgs::msg::Header& header,
@@ -134,7 +138,13 @@ private:
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void assignClusters(std::vector<Voxel*>& all);
     // 团内点相对最佳拟合平面的 RMS 残差（米）；点数不足返回 -1
+    // abs_nz_out 非空时写入法向 |nz|（最小特征值对应特征向量的 |z|）
     float planeFitRms(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<uint32_t>& idxs,
+        float* abs_nz_out = nullptr) const;
+    // 团内覆盖的唯一 ring 数
+    int clusterRingCount(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<uint32_t>& idxs) const;
     void removePointsInBadVoxels(
@@ -220,12 +230,17 @@ private:
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
-    // 删点后点聚类：团内点数少于此值则整团删除
+    // 删点后点聚类：团内点数少于此值则整团删除（仅 enable_small_cluster_filter_ 时跑）
     int min_cluster_points_{10};
-    // 平面拟合保护：连通团点数够且拟合残差小 → 不按 z 厚度删
+    bool enable_small_cluster_filter_{false};
+    // 平面拟合保护：点数够 + 拟合残差小 + 强度中位够，且非「水平少线」→ 不按 z 厚度删
     bool enable_plane_protect_{true};
     int plane_protect_min_points_{80};
     double plane_protect_rms_m_{0.015};
+    double plane_protect_intensity_{10.0};
+    // 水平薄片否决：|nz|>=此值 且 线数<=此值 → 不给豁免
+    double plane_protect_nz_min_{0.9};
+    int plane_protect_max_rings_{8};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;
@@ -235,6 +250,11 @@ private:
     std::vector<uint16_t> ring_of_cur_;
     std::vector<uint16_t> ring_scratch_;
     bool have_ring_{false};
+
+    // 与当前工作点云逐点对齐的强度；空表示这帧没有 intensity 字段
+    std::vector<float> intensity_of_cur_;
+    std::vector<float> intensity_scratch_;
+    bool have_intensity_{false};
 };
 
 #endif  // VANJEE_LIDAR_FILTER__CLOUD_PASSTHROUGH_FILTER_HPP_

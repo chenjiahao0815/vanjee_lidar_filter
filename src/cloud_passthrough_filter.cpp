@@ -177,9 +177,13 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
     this->declare_parameter("min_cluster_points", 10);
+    this->declare_parameter("enable_small_cluster_filter", false);
     this->declare_parameter("enable_plane_protect", true);
     this->declare_parameter("plane_protect_min_points", 80);
     this->declare_parameter("plane_protect_rms_m", 0.015);
+    this->declare_parameter("plane_protect_intensity", 10.0);
+    this->declare_parameter("plane_protect_nz_min", 0.9);
+    this->declare_parameter("plane_protect_max_rings", 8);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -284,6 +288,8 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (min_cluster_points_ < 1) {
         min_cluster_points_ = 10;
     }
+    enable_small_cluster_filter_ =
+        this->get_parameter("enable_small_cluster_filter").as_bool();
     enable_plane_protect_ = this->get_parameter("enable_plane_protect").as_bool();
     plane_protect_min_points_ = this->get_parameter("plane_protect_min_points").as_int();
     if (plane_protect_min_points_ < 3) {
@@ -292,6 +298,21 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     plane_protect_rms_m_ = this->get_parameter("plane_protect_rms_m").as_double();
     if (plane_protect_rms_m_ <= 0.0) {
         plane_protect_rms_m_ = 0.015;
+    }
+    plane_protect_intensity_ = this->get_parameter("plane_protect_intensity").as_double();
+    if (plane_protect_intensity_ < 0.0) {
+        plane_protect_intensity_ = 10.0;
+    }
+    plane_protect_nz_min_ = this->get_parameter("plane_protect_nz_min").as_double();
+    if (plane_protect_nz_min_ < 0.0) {
+        plane_protect_nz_min_ = 0.0;
+    }
+    if (plane_protect_nz_min_ > 1.0) {
+        plane_protect_nz_min_ = 1.0;
+    }
+    plane_protect_max_rings_ = this->get_parameter("plane_protect_max_rings").as_int();
+    if (plane_protect_max_rings_ < 1) {
+        plane_protect_max_rings_ = 8;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -429,10 +450,14 @@ void CloudPassthroughFilterNode::log_startup() const
                     thr_ratio_raw_.c_str(), thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 每格看厚度; 平面保护=%s (点数>=%d 且 RMS<=%.3fm); "
-                    "删后点聚类, 团点数<%d 则整团删",
+                    "  删点: 每格看厚度; 平面保护=%s (点数>=%d 且 RMS<=%.3fm 且 Imed>=%.1f; "
+                    "若 |nz|>=%.2f 且 线数<=%d 则否决); "
+                    "小团清扫=%s (门槛<%d)",
                     enable_plane_protect_ ? "开" : "关",
                     plane_protect_min_points_, plane_protect_rms_m_,
+                    plane_protect_intensity_,
+                    plane_protect_nz_min_, plane_protect_max_rings_,
+                    enable_small_cluster_filter_ ? "开" : "关",
                     min_cluster_points_);
         logVoxelScaleSamples();
     }
@@ -467,8 +492,10 @@ void CloudPassthroughFilterNode::removeNonFinitePointsInPlace(
             return;
         }
         const std::size_t before = cloud->points.size();
-        // 线号数组要和点一起压缩，否则后面按下标取线号会错位
+        // 线号/强度数组要和点一起压缩，否则后面按下标会错位
         const bool track_ring = have_ring_ && ring_of_cur_.size() == before;
+        const bool track_intensity =
+            have_intensity_ && intensity_of_cur_.size() == before;
         std::size_t write = 0;
         for (std::size_t i = 0; i < before; ++i) {
             const auto& p = cloud->points[i];
@@ -481,6 +508,9 @@ void CloudPassthroughFilterNode::removeNonFinitePointsInPlace(
             if (track_ring) {
                 ring_of_cur_[write] = ring_of_cur_[i];
             }
+            if (track_intensity) {
+                intensity_of_cur_[write] = intensity_of_cur_[i];
+            }
             ++write;
         }
         if (write == before) {
@@ -492,6 +522,9 @@ void CloudPassthroughFilterNode::removeNonFinitePointsInPlace(
         cloud->points.resize(write);
         if (track_ring) {
             ring_of_cur_.resize(write);
+        }
+        if (track_intensity) {
+            intensity_of_cur_.resize(write);
         }
         cloud->width = static_cast<uint32_t>(cloud->points.size());
         cloud->height = 1;
@@ -558,6 +591,71 @@ bool CloudPassthroughFilterNode::loadRingField(const sensor_msgs::msg::PointClou
         return true;
     }
 
+bool CloudPassthroughFilterNode::loadIntensityField(
+    const sensor_msgs::msg::PointCloud2& msg)
+{
+    intensity_of_cur_.clear();
+    have_intensity_ = false;
+
+    const sensor_msgs::msg::PointField* intensity_field = nullptr;
+    for (const auto& f : msg.fields) {
+        if (f.name == "intensity") {
+            intensity_field = &f;
+            break;
+        }
+    }
+    if (intensity_field == nullptr || msg.point_step == 0) {
+        return false;
+    }
+
+    const size_t n = static_cast<size_t>(msg.width) * static_cast<size_t>(msg.height);
+    if (msg.data.size() < n * msg.point_step) {
+        return false;
+    }
+    intensity_of_cur_.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* src =
+            msg.data.data() + i * msg.point_step + intensity_field->offset;
+        float v = 0.0f;
+        switch (intensity_field->datatype) {
+            case sensor_msgs::msg::PointField::UINT8:
+            case sensor_msgs::msg::PointField::INT8:
+                v = static_cast<float>(*src);
+                break;
+            case sensor_msgs::msg::PointField::UINT16:
+            case sensor_msgs::msg::PointField::INT16: {
+                uint16_t t = 0;
+                std::memcpy(&t, src, sizeof(t));
+                v = static_cast<float>(t);
+                break;
+            }
+            case sensor_msgs::msg::PointField::UINT32:
+            case sensor_msgs::msg::PointField::INT32: {
+                uint32_t t = 0;
+                std::memcpy(&t, src, sizeof(t));
+                v = static_cast<float>(t);
+                break;
+            }
+            case sensor_msgs::msg::PointField::FLOAT32: {
+                std::memcpy(&v, src, sizeof(v));
+                break;
+            }
+            case sensor_msgs::msg::PointField::FLOAT64: {
+                double t = 0.0;
+                std::memcpy(&t, src, sizeof(t));
+                v = static_cast<float>(t);
+                break;
+            }
+            default:
+                intensity_of_cur_.clear();
+                return false;
+        }
+        intensity_of_cur_[i] = v;
+    }
+    have_intensity_ = true;
+    return true;
+}
+
 void CloudPassthroughFilterNode::publish_cloud(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
                        const std_msgs::msg::Header& header,
@@ -588,9 +686,15 @@ CloudPassthroughFilterNode::passthrough_filter_cpu(
         }
         filtered->points.reserve(std::max(filtered->points.capacity(), cloud->size()));
         const bool track_ring = have_ring_ && ring_of_cur_.size() == cloud->size();
+        const bool track_intensity =
+            have_intensity_ && intensity_of_cur_.size() == cloud->size();
         if (track_ring) {
             ring_scratch_.clear();
             ring_scratch_.reserve(cloud->size());
+        }
+        if (track_intensity) {
+            intensity_scratch_.clear();
+            intensity_scratch_.reserve(cloud->size());
         }
         const std::size_t n = cloud->points.size();
         for (std::size_t i = 0; i < n; ++i) {
@@ -600,11 +704,17 @@ CloudPassthroughFilterNode::passthrough_filter_cpu(
                 filtered->points.push_back(p);
                 if (track_ring) {
                     ring_scratch_.push_back(ring_of_cur_[i]);
-            }
+                }
+                if (track_intensity) {
+                    intensity_scratch_.push_back(intensity_of_cur_[i]);
+                }
             }
         }
         if (track_ring) {
             ring_of_cur_.swap(ring_scratch_);
+        }
+        if (track_intensity) {
+            intensity_of_cur_.swap(intensity_scratch_);
         }
         filtered->width = static_cast<uint32_t>(filtered->points.size());
         return filtered;
@@ -628,8 +738,9 @@ void CloudPassthroughFilterNode::cloud_callback(
 
         auto current = memory_pool_->acquire();
         pcl::fromROSMsg(*msg, *current);
-        // 线号必须从原始消息取，pcl::PointXYZ 会把 ring 字段丢掉
+        // 线号/强度必须从原始消息取，pcl::PointXYZ 会把这些字段丢掉
         loadRingField(*msg);
+        loadIntensityField(*msg);
 
         if (current->empty()) {
             PT_WARN("收到空点云");
@@ -700,10 +811,14 @@ void CloudPassthroughFilterNode::cloud_callback(
         removePointsInBadVoxels(current, bad_voxels, msg->header);
         PT_INFO("体素删点结束: 坏格 %zu, 点数 %zu → %zu",
                 bad_voxels.size(), n_before_voxel, current->size());
-        const size_t n_before_small = current->size();
-        removeSmallPointClusters(current, msg->header);
-        PT_INFO("小团清扫结束: 点数 %zu → %zu (门槛<%d)",
-                n_before_small, current->size(), min_cluster_points_);
+        if (enable_small_cluster_filter_) {
+            const size_t n_before_small = current->size();
+            removeSmallPointClusters(current, msg->header);
+            PT_INFO("小团清扫结束: 点数 %zu → %zu (门槛<%d)",
+                    n_before_small, current->size(), min_cluster_points_);
+        } else {
+            PT_INFO("小团清扫: 关，跳过");
+        }
     } else if (debug_mode_) {
         publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
         }
@@ -1270,10 +1385,13 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
     }
     assignClusters(all);
 
-    // 删前保护：连通团点数够且平面拟合残差小 → 整团不按厚度删
+    // 删前保护：点数够 + 平面拟合残差小 + 强度中位够 → 整团不按厚度删
     size_t protect_clusters = 0;
     size_t protect_voxels = 0;
     if (enable_plane_protect_ && cloud && !cloud->empty()) {
+        if (!have_intensity_ || intensity_of_cur_.size() != cloud->size()) {
+            PT_WARN("平面保护: 本帧无对齐强度字段，跳过豁免（退回厚度规则）");
+        } else {
         const uint32_t n_cloud = static_cast<uint32_t>(cloud->points.size());
         std::unordered_map<int, std::vector<Voxel*>> by_cid;
         by_cid.reserve(all.size());
@@ -1296,9 +1414,27 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
             if (static_cast<int>(idxs.size()) < plane_protect_min_points_) {
                 return;
             }
-            const float rms = planeFitRms(cloud, idxs);
+            float nz = 0.0f;
+            const float rms = planeFitRms(cloud, idxs, &nz);
             if (!(rms >= 0.0f) ||
                 static_cast<double>(rms) > plane_protect_rms_m_) {
+                return;
+            }
+            const float imed = clusterIntensityMedian(idxs);
+            if (!(imed >= 0.0f) ||
+                static_cast<double>(imed) < plane_protect_intensity_) {
+                PT_INFO("平面保护否决: t%d 点数=%zu rms=%.4fm Imed=%.1f < %.1f",
+                        voxs.front()->cluster_id, idxs.size(), rms, imed,
+                        plane_protect_intensity_);
+                return;
+            }
+            const int nring = clusterRingCount(cloud, idxs);
+            if (static_cast<double>(nz) >= plane_protect_nz_min_ &&
+                nring <= plane_protect_max_rings_) {
+                PT_INFO("平面保护否决: t%d 点数=%zu rms=%.4fm Imed=%.1f "
+                        "|nz|=%.2f 线数=%d (水平少线)",
+                        voxs.front()->cluster_id, idxs.size(), rms, imed,
+                        nz, nring);
                 return;
             }
             ++protect_clusters;
@@ -1308,8 +1444,8 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
                     ++protect_voxels;
                 }
             }
-            PT_INFO("平面保护: t%d 点数=%zu rms=%.4fm → 整团不删",
-                    voxs.front()->cluster_id, idxs.size(), rms);
+            PT_INFO("平面保护: t%d 点数=%zu rms=%.4fm Imed=%.1f |nz|=%.2f 线=%d → 整团不删",
+                    voxs.front()->cluster_id, idxs.size(), rms, imed, nz, nring);
         };
 
         for (auto& entry : by_cid) {
@@ -1323,6 +1459,7 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
             std::vector<Voxel*> one{vp};
             try_protect(one);
         }
+        }  // have_intensity_
     }
 
     std::vector<Voxel*> bad;
@@ -1363,8 +1500,12 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
 
 float CloudPassthroughFilterNode::planeFitRms(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-    const std::vector<uint32_t>& idxs) const
+    const std::vector<uint32_t>& idxs,
+    float* abs_nz_out) const
 {
+    if (abs_nz_out != nullptr) {
+        *abs_nz_out = -1.0f;
+    }
     if (!cloud || idxs.size() < 3) {
         return -1.0f;
     }
@@ -1423,7 +1564,60 @@ float CloudPassthroughFilterNode::planeFitRms(
         return -1.0f;
     }
     const double lambda0 = std::max(0.0, es.eigenvalues()(0));
+    if (abs_nz_out != nullptr) {
+        // 最小特征值对应法向；取 |z| 分量判断是否接近水平面
+        *abs_nz_out = static_cast<float>(std::fabs(es.eigenvectors()(2, 0)));
+    }
     return static_cast<float>(std::sqrt(lambda0));
+}
+
+int CloudPassthroughFilterNode::clusterRingCount(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<uint32_t>& idxs) const
+{
+    if (!cloud || idxs.empty()) {
+        return 0;
+    }
+    const uint32_t n_cloud = static_cast<uint32_t>(cloud->points.size());
+    std::unordered_set<int> rings;
+    rings.reserve(32);
+    for (uint32_t i : idxs) {
+        if (i >= n_cloud) {
+            continue;
+        }
+        const auto& p = cloud->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        rings.insert(ringOfPoint(i, p.x, p.y, p.z));
+    }
+    return static_cast<int>(rings.size());
+}
+
+float CloudPassthroughFilterNode::clusterIntensityMedian(
+    const std::vector<uint32_t>& idxs) const
+{
+    if (!have_intensity_ || idxs.empty()) {
+        return -1.0f;
+    }
+    const size_t n_i = intensity_of_cur_.size();
+    std::vector<float> vals;
+    vals.reserve(idxs.size());
+    for (uint32_t i : idxs) {
+        if (static_cast<size_t>(i) >= n_i) {
+            continue;
+        }
+        const float v = intensity_of_cur_[i];
+        if (std::isfinite(v)) {
+            vals.push_back(v);
+        }
+    }
+    if (vals.empty()) {
+        return -1.0f;
+    }
+    const size_t mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + static_cast<std::ptrdiff_t>(mid), vals.end());
+    return vals[mid];
 }
 
 void CloudPassthroughFilterNode::removePointsInBadVoxels(
