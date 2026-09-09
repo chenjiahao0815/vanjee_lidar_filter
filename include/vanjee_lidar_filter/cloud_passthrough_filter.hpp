@@ -135,10 +135,6 @@ private:
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
         const std_msgs::msg::Header& header);
-    // 体素删点后：对剩余点再聚类，点数 < min_cluster_points_ 的整团删掉
-    void removeSmallPointClusters(
-        pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-        const std_msgs::msg::Header& header);
     void publishFilterDebug(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& raw_cloud,
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
@@ -216,8 +212,6 @@ private:
     double cluster_link_m_{0.18};
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
-    // 删点后点聚类：团内点数少于此值则整团删除
-    int min_cluster_points_{10};
     bool enable_voxel_filter_{true};
 
     std::unordered_map<int64_t, Voxel> grid_;

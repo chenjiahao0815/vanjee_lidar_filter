@@ -174,7 +174,6 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_link_m", 0.18);
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
-    this->declare_parameter("min_cluster_points", 10);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -275,9 +274,6 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (cluster_plane_k_ <= 0.0) {
         cluster_plane_k_ = 10.0;
     }
-    min_cluster_points_ = this->get_parameter("min_cluster_points").as_int();
-    if (min_cluster_points_ < 1) {
-        min_cluster_points_ = 10;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -415,8 +411,7 @@ void CloudPassthroughFilterNode::log_startup() const
                     thr_ratio_raw_.c_str(), thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 每格看厚度; 删后点聚类, 团点数<%d 则整团删",
-                    min_cluster_points_);
+                    "  删点: 每格看厚度");
         logVoxelScaleSamples();
     }
 }
@@ -683,10 +678,6 @@ void CloudPassthroughFilterNode::cloud_callback(
         removePointsInBadVoxels(current, bad_voxels, msg->header);
         PT_INFO("体素删点结束: 坏格 %zu, 点数 %zu → %zu",
                 bad_voxels.size(), n_before_voxel, current->size());
-        const size_t n_before_small = current->size();
-        removeSmallPointClusters(current, msg->header);
-        PT_INFO("小团清扫结束: 点数 %zu → %zu (门槛<%d)",
-                n_before_small, current->size(), min_cluster_points_);
     } else if (debug_mode_) {
         publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
         }
@@ -1352,192 +1343,6 @@ void CloudPassthroughFilterNode::removePointsInBadVoxels(
     if (removed) {
         removed->width = static_cast<uint32_t>(removed->points.size());
         publish_cloud(removed, header, removed_publisher_, "被删点");
-        memory_pool_->release(removed);
-    }
-}
-
-void CloudPassthroughFilterNode::removeSmallPointClusters(
-    pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-    const std_msgs::msg::Header& header)
-{
-    if (!cloud || cloud->empty()) {
-        return;
-    }
-    if (min_cluster_points_ <= 1) {
-        return;
-    }
-
-    const size_t n = cloud->points.size();
-    std::vector<int> parent(n);
-    for (size_t i = 0; i < n; ++i) {
-        parent[i] = static_cast<int>(i);
-    }
-    auto find = [&](int x) {
-        while (parent[static_cast<size_t>(x)] != x) {
-            parent[static_cast<size_t>(x)] =
-                parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
-            x = parent[static_cast<size_t>(x)];
-        }
-        return x;
-    };
-    auto unite = [&](int a, int b) {
-        a = find(a);
-        b = find(b);
-        if (a != b) {
-            parent[static_cast<size_t>(b)] = a;
-        }
-    };
-
-    // 空间哈希：格子边长取连通下限，邻域按距离自适应搜索
-    const float cell = static_cast<float>(std::max(cluster_link_m_, 0.05));
-    const float inv_cell = 1.0f / cell;
-    const float k3d = static_cast<float>(cluster_link_k_);
-    const float kxy = static_cast<float>(cluster_plane_k_);
-    const float link_min = static_cast<float>(cluster_link_m_);
-    const float ang = static_cast<float>(ang_v_);
-
-    struct CellKey {
-        int ix{0};
-        int iy{0};
-        int iz{0};
-        bool operator==(const CellKey& o) const
-        {
-            return ix == o.ix && iy == o.iy && iz == o.iz;
-        }
-    };
-    struct CellHash {
-        size_t operator()(const CellKey& k) const
-        {
-            return (static_cast<size_t>(k.ix) * 73856093u) ^
-                   (static_cast<size_t>(k.iy) * 19349663u) ^
-                   (static_cast<size_t>(k.iz) * 83492791u);
-        }
-    };
-
-    std::unordered_map<CellKey, std::vector<int>, CellHash> buckets;
-    buckets.reserve(n * 2 + 1);
-    for (size_t i = 0; i < n; ++i) {
-        const auto& p = cloud->points[i];
-        CellKey key{
-            static_cast<int>(std::floor(p.x * inv_cell)),
-            static_cast<int>(std::floor(p.y * inv_cell)),
-            static_cast<int>(std::floor(p.z * inv_cell))};
-        buckets[key].push_back(static_cast<int>(i));
-    }
-
-    auto shouldJoin = [&](int ia, int ib) {
-        const auto& a = cloud->points[static_cast<size_t>(ia)];
-        const auto& b = cloud->points[static_cast<size_t>(ib)];
-        const float dx = a.x - b.x;
-        const float dy = a.y - b.y;
-        const float dz = a.z - b.z;
-        const float ra = std::hypot(a.x, a.y);
-        const float rb = std::hypot(b.x, b.y);
-        const float rr = std::max(std::max(ra, rb), 1e-3f);
-        const float gap = rr * ang;
-        const float link3d = std::max(link_min, k3d * gap);
-        const float dxy2 = dx * dx + dy * dy;
-        const float d3 = dxy2 + dz * dz;
-        if (d3 <= link3d * link3d) {
-            return true;
-        }
-        const float z_band = std::max(0.04f, 2.0f * gap);
-        const float link_xy = std::max(link3d, kxy * gap);
-        return std::fabs(dz) <= z_band && dxy2 <= link_xy * link_xy;
-    };
-
-    for (size_t i = 0; i < n; ++i) {
-        const auto& p = cloud->points[i];
-        const float ra = std::hypot(p.x, p.y);
-        const float gap = std::max(ra, 1e-3f) * ang;
-        const float link = std::max(
-            link_min, std::max(k3d * gap, kxy * gap));
-        const int rad = std::max(1, static_cast<int>(std::ceil(link * inv_cell)));
-        const int ix0 = static_cast<int>(std::floor(p.x * inv_cell));
-        const int iy0 = static_cast<int>(std::floor(p.y * inv_cell));
-        const int iz0 = static_cast<int>(std::floor(p.z * inv_cell));
-        for (int dx = -rad; dx <= rad; ++dx) {
-            for (int dy = -rad; dy <= rad; ++dy) {
-                for (int dz = -rad; dz <= rad; ++dz) {
-                    auto it = buckets.find(CellKey{ix0 + dx, iy0 + dy, iz0 + dz});
-                    if (it == buckets.end()) {
-                        continue;
-                    }
-                    for (int j : it->second) {
-                        if (j <= static_cast<int>(i)) {
-                            continue;
-                        }
-                        if (shouldJoin(static_cast<int>(i), j)) {
-                            unite(static_cast<int>(i), j);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    std::vector<int> root_size(n, 0);
-    std::vector<int> root_of(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        const int r = find(static_cast<int>(i));
-        root_of[i] = r;
-        ++root_size[static_cast<size_t>(r)];
-    }
-
-    size_t small_clusters = 0;
-    size_t marked = 0;
-    std::vector<char> drop(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        const int r = root_of[i];
-        if (root_size[static_cast<size_t>(r)] < min_cluster_points_) {
-            if (drop[i] == 0) {
-                drop[i] = 1;
-                ++marked;
-            }
-            if (r == static_cast<int>(i)) {
-                ++small_clusters;
-            }
-        }
-    }
-
-    if (marked == 0) {
-        PT_INFO("小团清扫: 团门槛=%d, 无小团, 点数保持 %zu",
-                min_cluster_points_, n);
-        return;
-    }
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr removed;
-    if (debug_mode_ && removed_publisher_) {
-        removed = memory_pool_->acquire();
-        removed->height = 1;
-        removed->is_dense = true;
-        removed->points.reserve(marked);
-    }
-
-    size_t write = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (drop[i] != 0) {
-            if (removed) {
-                removed->points.push_back(cloud->points[i]);
-            }
-            continue;
-        }
-        if (write != i) {
-            cloud->points[write] = cloud->points[i];
-        }
-        ++write;
-    }
-    cloud->points.resize(write);
-    cloud->width = static_cast<uint32_t>(write);
-    cloud->height = 1;
-    cloud->is_dense = true;
-
-    PT_INFO("小团清扫: 小团 %zu 个, 去掉 %zu 点, %zu → %zu (门槛<%d)",
-            small_clusters, marked, n, cloud->size(), min_cluster_points_);
-
-    if (removed) {
-        removed->width = static_cast<uint32_t>(removed->points.size());
-        publish_cloud(removed, header, removed_publisher_, "小团被删点");
         memory_pool_->release(removed);
     }
 }
