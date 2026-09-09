@@ -1412,12 +1412,20 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels(
                 }
             }
             if (static_cast<int>(idxs.size()) < plane_protect_min_points_) {
+                PT_INFO("平面保护跳过: t%d 点数=%zu < %d",
+                        voxs.front()->cluster_id, idxs.size(),
+                        plane_protect_min_points_);
                 return;
             }
             float nz = 0.0f;
             const float rms = planeFitRms(cloud, idxs, &nz);
             if (!(rms >= 0.0f) ||
                 static_cast<double>(rms) > plane_protect_rms_m_) {
+                const int nring = clusterRingCount(cloud, idxs);
+                PT_INFO("平面保护跳过: t%d 点数=%zu rms=%.4fm > %.3f "
+                        "|nz|=%.2f 线=%d",
+                        voxs.front()->cluster_id, idxs.size(), rms,
+                        plane_protect_rms_m_, nz, nring);
                 return;
             }
             const float imed = clusterIntensityMedian(idxs);

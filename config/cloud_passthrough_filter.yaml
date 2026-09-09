@@ -53,7 +53,7 @@ cloud_passthrough_filter_node:
     max_z: 2.0 
     size_z_min: 0.05
 
-    size_xy_bands: "(1.0,20.0),(2.0,22.0),(3.0,14.0)"
+    size_xy_bands: "(1.0,3.0),(2.0,6.0),(3.0,14.0)"
     size_z_bands: "(0.0,3.0),(1.0,4.0),(2.0,8.0),(3.0,12.0)"
     size_z_ratio: 4.0
 
@@ -72,7 +72,7 @@ cloud_passthrough_filter_node:
     # 平面拟合保护
     enable_plane_protect: true
     plane_protect_min_points: 80   # 越小越留
-    plane_protect_rms_m: 0.015  # 越小越删
+    plane_protect_rms_m: 0.07  # 原0.015拦不住本帧车体t2(rms≈0.069)；越小越严
 
     plane_protect_intensity: 10.0  # 团强度中位低于此值 → 不给豁免
     # 水平薄片否决豁免：|nz|>=此值 且 覆盖线数<=此值 → 当 pancake，回落厚度规则
