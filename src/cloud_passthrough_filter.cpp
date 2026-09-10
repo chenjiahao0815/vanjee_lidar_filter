@@ -183,6 +183,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("seed_rms_m", 0.02);
     this->declare_parameter("grow_pred_m", 0.05);
     this->declare_parameter("grow_min_points", 3);
+    this->declare_parameter("restore_mode", 0);
+    this->declare_parameter("cluster_min_rings", 4);
+    this->declare_parameter("cluster_min_radius", 1.3);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -314,6 +317,18 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     }
     if (grow_min_points_ > seed_win_) {
         grow_min_points_ = seed_win_;
+    }
+    restore_mode_ = this->get_parameter("restore_mode").as_int();
+    if (restore_mode_ != 1) {
+        restore_mode_ = 0;
+    }
+    cluster_min_rings_ = this->get_parameter("cluster_min_rings").as_int();
+    if (cluster_min_rings_ < 1) {
+        cluster_min_rings_ = 1;
+    }
+    cluster_min_radius_ = this->get_parameter("cluster_min_radius").as_double();
+    if (cluster_min_radius_ < 0.0) {
+        cluster_min_radius_ = 0.0;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -457,6 +472,12 @@ void CloudPassthroughFilterNode::log_startup() const
                     enable_line_restore_gate_
                         ? "；捞回前 ring 滑窗种子+双侧生长"
                         : "；线门闩关");
+        if (restore_mode_ == 1) {
+            RCLCPP_INFO(this->get_logger(),
+                        "  ⚠ 豁免模式=1 团级自证：小格连通团覆盖线>=%d 且 点径向>=%.2f m "
+                        "才捞回；大格复核与线门闩【不生效】",
+                        cluster_min_rings_, cluster_min_radius_);
+        }
         if (enable_line_restore_gate_) {
             RCLCPP_INFO(this->get_logger(),
                         "  线门闩: gap_k=%.2f seed_win=%d seed_rms<=%.3fm "
@@ -749,37 +770,44 @@ void CloudPassthroughFilterNode::cloud_callback(
         auto small_grid = std::move(grid_);
         fine_grid_.clear();
 
-        // 2) 大格：同一朵原云 + bands2（不是只拿已删点划格）
-        useSizeXyBands(2);
-        grid_.clear();
-        buildVoxelGrid(current);
-        const std::vector<Voxel*> bad_large = collectBadVoxels();
-        std::unordered_set<const Voxel*> bad_large_set;
-        bad_large_set.reserve(bad_large.size() * 2 + 1);
-        for (const Voxel* v : bad_large) {
-            if (v) {
-                bad_large_set.insert(v);
-            }
-        }
-
-        std::vector<Voxel*> point_large(n, nullptr);
-        for (auto& entry : grid_) {
-            Voxel* vp = &entry.second;
-            for (uint32_t idx : vp->idx) {
-                if (idx < n) {
-                    point_large[idx] = vp;
+        size_t n_restored = 0;
+        if (restore_mode_ == 1) {
+            // 团级自证：直接用刚算好的小格团发豁免，不再走"大格 + 门闩"
+            grid_ = std::move(small_grid);
+            useSizeXyBands(1);
+            restoreByCluster(current, drop, restored, &n_restored);
+        } else {
+            // 2) 大格：同一朵原云 + bands2（不是只拿已删点划格）
+            useSizeXyBands(2);
+            grid_.clear();
+            buildVoxelGrid(current);
+            const std::vector<Voxel*> bad_large = collectBadVoxels();
+            std::unordered_set<const Voxel*> bad_large_set;
+            bad_large_set.reserve(bad_large.size() * 2 + 1);
+            for (const Voxel* v : bad_large) {
+                if (v) {
+                    bad_large_set.insert(v);
                 }
             }
+
+            std::vector<Voxel*> point_large(n, nullptr);
+            for (auto& entry : grid_) {
+                Voxel* vp = &entry.second;
+                for (uint32_t idx : vp->idx) {
+                    if (idx < n) {
+                        point_large[idx] = vp;
+                    }
+                }
+            }
+
+            // 3) 小格删了的点：若所在大格判留 → 候选捞回；有 ring 时再按扫描线门闩
+            gateRestoreByScanLines(
+                current, point_large, bad_large_set, drop, restored, &n_restored);
+
+            // 可视化仍用小格；标记捞回格，最终坏格=仍要删的点所在格
+            grid_ = std::move(small_grid);
+            useSizeXyBands(1);
         }
-
-        // 3) 小格删了的点：若所在大格判留 → 候选捞回；有 ring 时再按扫描线门闩
-        size_t n_restored = 0;
-        gateRestoreByScanLines(
-            current, point_large, bad_large_set, drop, restored, &n_restored);
-
-        // 可视化仍用小格；标记捞回格，最终坏格=仍要删的点所在格
-        grid_ = std::move(small_grid);
-        useSizeXyBands(1);
         bad_voxels.clear();
         bad_voxels.reserve(bad_small.size());
         for (auto& entry : grid_) {
@@ -1773,6 +1801,67 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }
     return bad;
+}
+
+// 模式1：团级自证。豁免的发放单位是"小格连通团"，不是"大格"。
+// 原因：大格判留看的是"这块表面在 z 上有多陡"，缓坡在 1m 格子里也只跨几厘米，
+// 会被判薄，于是它的点连候选池都进不去。团自己覆盖的 ring 数则直接反映
+// "它被多少根激光线扫到"，缓坡跨 7~8 条线，而近场薄片只跨 2 条。
+void CloudPassthroughFilterNode::restoreByCluster(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    std::vector<char>& drop,
+    std::vector<char>& restored,
+    size_t* n_restored_out) const
+{
+    const uint32_t n =
+        cloud ? static_cast<uint32_t>(cloud->points.size()) : 0u;
+    size_t n_restored = 0;
+
+    std::unordered_map<int, std::vector<uint32_t>> by_cluster;
+    std::unordered_map<int, uint64_t> ring_mask_of;
+    for (const auto& entry : grid_) {
+        const Voxel& v = entry.second;
+        if (v.cluster_id <= 0) {
+            continue;
+        }
+        auto& dst = by_cluster[v.cluster_id];
+        dst.insert(dst.end(), v.idx.begin(), v.idx.end());
+        ring_mask_of[v.cluster_id] |= v.ring_mask;
+    }
+
+    const double r_min = cluster_min_radius_;
+    for (const auto& kv : by_cluster) {
+        const auto mit = ring_mask_of.find(kv.first);
+        const int rings = (mit == ring_mask_of.end())
+                              ? 0
+                              : __builtin_popcountll(mit->second);
+        if (rings < cluster_min_rings_) {
+            continue;
+        }
+        for (uint32_t i : kv.second) {
+            if (i >= n || drop[i] == 0) {
+                continue;
+            }
+            if (r_min > 0.0) {
+                const auto& p = cloud->points[i];
+                if (std::hypot(static_cast<double>(p.x),
+                               static_cast<double>(p.y)) < r_min) {
+                    continue;  // 近场伪影区：点自身太近，不豁免
+                }
+            }
+            drop[i] = 0;
+            if (i < restored.size()) {
+                restored[i] = 1;
+            }
+            ++n_restored;
+        }
+    }
+
+    if (n_restored_out) {
+        *n_restored_out = n_restored;
+    }
+    PT_INFO("团级自证: 团 %zu 个, 门槛 线>=%d 径向>=%.2f, 捞回 %zu 点",
+            by_cluster.size(), cluster_min_rings_, cluster_min_radius_, n_restored);
 }
 
 // 团级诊断：把每个连通团(= RViz 标签上的 tN)的特征打一条日志，

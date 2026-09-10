@@ -172,6 +172,14 @@ private:
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<char>& drop,
         const std::vector<char>& restored) const;
+    // 模式1：团级自证。grid_ 必须是"小格"且已算好 cluster_id。
+    // 团覆盖线数 >= cluster_min_rings_ 时，把该团被删的点还回来（点自身径向
+    // 小于 cluster_min_radius_ 的不还）。
+    void restoreByCluster(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        std::vector<char>& drop,
+        std::vector<char>& restored,
+        size_t* n_restored_out) const;
     int64_t makeKey(int ix, int iy, int iz) const;
     int64_t makeCoarseKey(int ox, int oy, int oz, int nxy, int nz) const;
     int floorDiv(int a, int b) const;
@@ -258,6 +266,13 @@ private:
     double seed_rms_m_{0.02};         // 种子局部直线 RMS
     double grow_pred_m_{0.05};        // 生长：到当前直线预测偏差
     int grow_min_points_{3};          // 长完至少多少点才捞回
+    // 豁免发放模式：
+    //   0 = 大格判留 + ring 门闩（原行为）
+    //   1 = 团级自证：小格连通团自己覆盖的线数够，就把整团被小格删的点全还给它
+    int restore_mode_{0};
+    int cluster_min_rings_{4};         // 模式1：团覆盖 ring 数下限
+    // 模式1：点自身径向 < 该值一律不豁免（近场伪影区）；0 = 关闭
+    double cluster_min_radius_{1.3};
     // 无 ring / 恢复 ring 各只打一次，避免刷屏
     mutable bool line_gate_warned_no_ring_{false};
 
