@@ -82,6 +82,7 @@ struct Voxel {
     std::vector<uint32_t> idx;
     int cluster_id{0};  // 连通团编号，0=未成团/单格；可视化/日志用
     int cell_id{0};     // 本帧体素格子编号，可视化/删点日志对照用
+    bool restored{false};  // 小格本判删、大格捞回：青框可视化
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -131,15 +132,22 @@ private:
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
     void assignClusters(std::vector<Voxel*>& all);
+    void useSizeXyBands(int which);  // 1=小格 2=大格
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
+        const std_msgs::msg::Header& header);
+    void removePointsByMask(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<char>& drop,
         const std_msgs::msg::Header& header);
     void publishFilterDebug(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& raw_cloud,
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
         const std::vector<Voxel*>& bad_voxels,
-        const std_msgs::msg::Header& header);
+        const std_msgs::msg::Header& header,
+        const std::vector<char>* drop_mask = nullptr,
+        const std::vector<char>* restored_mask = nullptr);
     int64_t makeKey(int ix, int iy, int iz) const;
     int64_t makeCoarseKey(int ox, int oy, int oz, int nxy, int nz) const;
     int floorDiv(int a, int b) const;
@@ -198,8 +206,13 @@ private:
     double max_xy_{0.5};
     double max_z_{0.5};
     // 横向边长 = base_xy × 分段倍率，再夹在 [base_xy, max_xy]
-    std::vector<SizeXyBand> size_xy_bands_;
+    // bands1=小格先删；bands2=大格用整云再判，捞回小格误删点
+    std::vector<SizeXyBand> size_xy_bands_;       // 当前生效（build/lookup 用）
     std::string size_xy_bands_raw_;
+    std::vector<SizeXyBand> size_xy_bands1_;
+    std::string size_xy_bands1_raw_;
+    std::vector<SizeXyBand> size_xy_bands2_;
+    std::string size_xy_bands2_raw_;
     // 纵向边长 = size_z_bands(r) × 线间距；bands 空则退回 size_z_ratio
     std::vector<SizeXyBand> size_z_bands_;
     std::string size_z_bands_raw_;
