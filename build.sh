@@ -12,6 +12,28 @@ if [[ -z "${ROS_DISTRO:-}" ]]; then
   source /opt/ros/humble/setup.bash
 fi
 
+# 清掉"指向已不存在的旧工作区"的残留路径。
+# 由来：以前在顶层 vajee_lidar/ 下跑过 colcon 并 source 过它的 install/setup.bash，
+# 之后顶层 build/install/log 被删掉了，但当前 shell 的环境变量还留着那些路径，
+# colcon 就会刷一堆 "The path '.../vajee_lidar/install' ... doesn't exist" 警告。
+# 这里把不存在的条目摘掉再编译，效果等同于开一个新终端。
+_vlf_prune_prefix() {
+  local old="${1:-}" out=""
+  [[ -z "$old" ]] && return 0
+  local entry
+  local IFS=':'
+  for entry in $old; do
+    [[ -z "$entry" ]] && continue
+    [[ -e "$entry" ]] && out="${out:+$out:}$entry"
+  done
+  shift
+  export "$1=$out"
+}
+for _VLF_V in COLCON_PREFIX_PATH AMENT_PREFIX_PATH CMAKE_PREFIX_PATH ROS_PACKAGE_PATH; do
+  _vlf_prune_prefix "${!_VLF_V:-}" "$_VLF_V"
+done
+unset _VLF_V
+
 echo "[build.sh] 开始编译: $_VLF_ROOT"
 colcon build --packages-select vanjee_lidar_filter --symlink-install
 _VLF_RC=$?
