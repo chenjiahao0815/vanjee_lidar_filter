@@ -133,6 +133,24 @@ private:
     std::vector<Voxel*> collectBadVoxels();
     void assignClusters(std::vector<Voxel*>& all);
     void useSizeXyBands(int which);  // 1=小格 2=大格
+    // 大格捞回门闩：ring 滑窗种子 + 向两侧生长；无真实 ring 则跳过
+    // drop 入参=小格已标删；出参=最终仍删。restored 写出捞回点。
+    void gateRestoreByScanLines(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<Voxel*>& point_large,
+        const std::unordered_set<const Voxel*>& bad_large_set,
+        std::vector<char>& drop,
+        std::vector<char>& restored,
+        size_t* n_restored_out) const;
+    static float lineFitRms3d(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<uint32_t>& idxs);
+    // 拟合直线：成功返回 RMS，并写出中心与单位方向；失败返回 <0
+    static float lineFit3d(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<uint32_t>& idxs,
+        double* cx, double* cy, double* cz,
+        double* ux, double* uy, double* uz);
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
@@ -148,6 +166,12 @@ private:
         const std_msgs::msg::Header& header,
         const std::vector<char>* drop_mask = nullptr,
         const std::vector<char>* restored_mask = nullptr);
+    // 团级诊断日志：把 RViz 标签上的 tN 团的几何特征打进日志，
+    // 便于回答"这一团为什么被删/被捞回"
+    void logClusterStats(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<char>& drop,
+        const std::vector<char>& restored) const;
     int64_t makeKey(int ix, int iy, int iz) const;
     int64_t makeCoarseKey(int ox, int oy, int oz, int nxy, int nz) const;
     int floorDiv(int a, int b) const;
@@ -226,6 +250,16 @@ private:
     double cluster_link_k_{6.0};
     double cluster_plane_k_{10.0};
     bool enable_voxel_filter_{true};
+
+    // 大格捞回：ring 上滑窗种子 + 向两侧生长
+    bool enable_line_restore_gate_{true};
+    double line_gap_k_{2.0};          // 邻点距 < k * r * ang_h
+    int seed_win_{4};                 // 种子窗口点数
+    double seed_rms_m_{0.02};         // 种子局部直线 RMS
+    double grow_pred_m_{0.05};        // 生长：到当前直线预测偏差
+    int grow_min_points_{3};          // 长完至少多少点才捞回
+    // 无 ring / 恢复 ring 各只打一次，避免刷屏
+    mutable bool line_gate_warned_no_ring_{false};
 
     std::unordered_map<int64_t, Voxel> grid_;
     std::unordered_map<int64_t, Voxel> fine_grid_;

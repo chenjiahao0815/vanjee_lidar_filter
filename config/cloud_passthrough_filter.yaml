@@ -67,6 +67,14 @@ cloud_passthrough_filter_node:
     cluster_link_k: 6.0
     cluster_plane_k: 10.0
 
+    enable_line_restore_gate: true
+    # ring 滑窗种子 + 向两侧生长（只卡大格捞回）
+    line_gap_k: 2.0              # 邻点距 < k * r * ang_h（切段/生长共用）
+    seed_win: 4                  # 种子窗口点数（短墙可试 3）
+    seed_rms_m: 0.02             # 种子局部直线 RMS
+    grow_pred_m: 0.05            # 生长：偏离当前直线预测的上限（米）
+    grow_min_points: 3           # 长完至少这么多点才捞回
+
     # 红=体素删掉 青=大格捞回 绿=其它留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"
     boxes_topic: "/vanjee/filter_boxes"

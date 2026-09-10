@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -176,6 +177,12 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("cluster_link_m", 0.18);
     this->declare_parameter("cluster_link_k", 6.0);
     this->declare_parameter("cluster_plane_k", 10.0);
+    this->declare_parameter("enable_line_restore_gate", true);
+    this->declare_parameter("line_gap_k", 2.0);
+    this->declare_parameter("seed_win", 4);
+    this->declare_parameter("seed_rms_m", 0.02);
+    this->declare_parameter("grow_pred_m", 0.05);
+    this->declare_parameter("grow_min_points", 3);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -282,6 +289,31 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     }
     if (cluster_plane_k_ <= 0.0) {
         cluster_plane_k_ = 10.0;
+    }
+    enable_line_restore_gate_ =
+        this->get_parameter("enable_line_restore_gate").as_bool();
+    line_gap_k_ = this->get_parameter("line_gap_k").as_double();
+    if (line_gap_k_ <= 0.0) {
+        line_gap_k_ = 2.0;
+    }
+    seed_win_ = this->get_parameter("seed_win").as_int();
+    if (seed_win_ < 3) {
+        seed_win_ = 3;
+    }
+    seed_rms_m_ = this->get_parameter("seed_rms_m").as_double();
+    if (seed_rms_m_ <= 0.0) {
+        seed_rms_m_ = 0.02;
+    }
+    grow_pred_m_ = this->get_parameter("grow_pred_m").as_double();
+    if (grow_pred_m_ <= 0.0) {
+        grow_pred_m_ = 0.05;
+    }
+    grow_min_points_ = this->get_parameter("grow_min_points").as_int();
+    if (grow_min_points_ < 2) {
+        grow_min_points_ = 3;
+    }
+    if (grow_min_points_ > seed_win_) {
+        grow_min_points_ = seed_win_;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -420,7 +452,18 @@ void CloudPassthroughFilterNode::log_startup() const
                     thr_ratio_raw_.c_str(), thr_z_min_,
                     cluster_link_m_, cluster_link_k_, cluster_plane_k_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 小格厚度先删，大格整云再判，大格留则捞回");
+                    "  删点: 小格厚度先删，大格整云再判，大格留则捞回"
+                    "%s",
+                    enable_line_restore_gate_
+                        ? "；捞回前 ring 滑窗种子+双侧生长"
+                        : "；线门闩关");
+        if (enable_line_restore_gate_) {
+            RCLCPP_INFO(this->get_logger(),
+                        "  线门闩: gap_k=%.2f seed_win=%d seed_rms<=%.3fm "
+                        "grow_pred<=%.3fm grow_min=%d；无 ring 则跳过",
+                        line_gap_k_, seed_win_, seed_rms_m_,
+                        grow_pred_m_, grow_min_points_);
+        }
         RCLCPP_INFO(this->get_logger(), "  --- bands1 样例(启动默认) ---");
         logVoxelScaleSamples();
     }
@@ -729,19 +772,10 @@ void CloudPassthroughFilterNode::cloud_callback(
             }
         }
 
-        // 3) 小格删了的点：若所在大格判留 → 捞回
+        // 3) 小格删了的点：若所在大格判留 → 候选捞回；有 ring 时再按扫描线门闩
         size_t n_restored = 0;
-        for (uint32_t i = 0; i < n; ++i) {
-            if (drop[i] == 0) {
-                continue;
-            }
-            const Voxel* lv = point_large[i];
-            if (lv != nullptr && bad_large_set.count(lv) == 0) {
-                drop[i] = 0;
-                restored[i] = 1;
-                ++n_restored;
-            }
-        }
+        gateRestoreByScanLines(
+            current, point_large, bad_large_set, drop, restored, &n_restored);
 
         // 可视化仍用小格；标记捞回格，最终坏格=仍要删的点所在格
         grid_ = std::move(small_grid);
@@ -774,6 +808,8 @@ void CloudPassthroughFilterNode::cloud_callback(
 
         PT_INFO("双尺度: 小格标删 %zu 点, 大格捞回 %zu 点, 最终删格 %zu",
                 marked_small, n_restored, bad_voxels.size());
+
+        logClusterStats(current, drop, restored);
 
         if (debug_mode_) {
             publishFilterDebug(raw_viz, current, bad_voxels, msg->header,
@@ -808,6 +844,357 @@ void CloudPassthroughFilterNode::useSizeXyBands(int which)
     } else {
         size_xy_bands_ = size_xy_bands1_;
         size_xy_bands_raw_ = size_xy_bands1_raw_;
+    }
+}
+
+float CloudPassthroughFilterNode::lineFit3d(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<uint32_t>& idxs,
+    double* cx_out, double* cy_out, double* cz_out,
+    double* ux_out, double* uy_out, double* uz_out)
+{
+    const size_t n = idxs.size();
+    if (!cloud || n < 3) {
+        return -1.0f;
+    }
+    double cx = 0.0, cy = 0.0, cz = 0.0;
+    for (uint32_t i : idxs) {
+        const auto& p = cloud->points[i];
+        cx += p.x;
+        cy += p.y;
+        cz += p.z;
+    }
+    const double inv = 1.0 / static_cast<double>(n);
+    cx *= inv;
+    cy *= inv;
+    cz *= inv;
+
+    double xx = 0.0, xy = 0.0, xz = 0.0, yy = 0.0, yz = 0.0, zz = 0.0;
+    for (uint32_t i : idxs) {
+        const auto& p = cloud->points[i];
+        const double dx = p.x - cx;
+        const double dy = p.y - cy;
+        const double dz = p.z - cz;
+        xx += dx * dx;
+        xy += dx * dy;
+        xz += dx * dz;
+        yy += dy * dy;
+        yz += dy * dz;
+        zz += dz * dz;
+    }
+
+    // 幂迭代求协方差最大特征向量 ≈ 直线方向
+    double ux = 1.0, uy = 0.0, uz = 0.0;
+    if (yy >= xx && yy >= zz) {
+        ux = 0.0;
+        uy = 1.0;
+        uz = 0.0;
+    } else if (zz >= xx && zz >= yy) {
+        ux = 0.0;
+        uy = 0.0;
+        uz = 1.0;
+    }
+    for (int it = 0; it < 12; ++it) {
+        const double vx = xx * ux + xy * uy + xz * uz;
+        const double vy = xy * ux + yy * uy + yz * uz;
+        const double vz = xz * ux + yz * uy + zz * uz;
+        const double norm = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (norm < 1e-18) {
+            return -1.0f;
+        }
+        ux = vx / norm;
+        uy = vy / norm;
+        uz = vz / norm;
+    }
+
+    double sum_sq = 0.0;
+    for (uint32_t i : idxs) {
+        const auto& p = cloud->points[i];
+        const double dx = p.x - cx;
+        const double dy = p.y - cy;
+        const double dz = p.z - cz;
+        const double cxu = dy * uz - dz * uy;
+        const double cyu = dz * ux - dx * uz;
+        const double czu = dx * uy - dy * ux;
+        sum_sq += cxu * cxu + cyu * cyu + czu * czu;
+    }
+    if (cx_out) {
+        *cx_out = cx;
+    }
+    if (cy_out) {
+        *cy_out = cy;
+    }
+    if (cz_out) {
+        *cz_out = cz;
+    }
+    if (ux_out) {
+        *ux_out = ux;
+    }
+    if (uy_out) {
+        *uy_out = uy;
+    }
+    if (uz_out) {
+        *uz_out = uz;
+    }
+    return static_cast<float>(std::sqrt(sum_sq / static_cast<double>(n)));
+}
+
+float CloudPassthroughFilterNode::lineFitRms3d(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<uint32_t>& idxs)
+{
+    return lineFit3d(cloud, idxs, nullptr, nullptr, nullptr,
+                     nullptr, nullptr, nullptr);
+}
+
+void CloudPassthroughFilterNode::gateRestoreByScanLines(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<Voxel*>& point_large,
+    const std::unordered_set<const Voxel*>& bad_large_set,
+    std::vector<char>& drop,
+    std::vector<char>& restored,
+    size_t* n_restored_out) const
+{
+    const uint32_t n =
+        cloud ? static_cast<uint32_t>(cloud->points.size()) : 0;
+    size_t n_restored = 0;
+    if (restored.size() != n) {
+        restored.assign(n, 0);
+    }
+
+    auto restore_unconditional = [&]() {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (drop[i] == 0) {
+                continue;
+            }
+            const Voxel* lv = (i < point_large.size()) ? point_large[i] : nullptr;
+            if (lv != nullptr && bad_large_set.count(lv) == 0) {
+                drop[i] = 0;
+                restored[i] = 1;
+                ++n_restored;
+            }
+        }
+    };
+
+    if (!enable_line_restore_gate_) {
+        restore_unconditional();
+        if (n_restored_out) {
+            *n_restored_out = n_restored;
+        }
+        return;
+    }
+
+    // 无真实 ring：跳过门闩，仍无条件捞回；缺/恢复各打一次
+    if (!have_ring_ || ring_of_cur_.size() != n) {
+        if (!line_gate_warned_no_ring_) {
+            RCLCPP_WARN(this->get_logger(),
+                        "线门闩: 本帧无真实 ring 字段，跳过滑窗生长，"
+                        "大格捞回退回无条件（有 ring 后会再提示一次）");
+            line_gate_warned_no_ring_ = true;
+        }
+        restore_unconditional();
+        if (n_restored_out) {
+            *n_restored_out = n_restored;
+        }
+        return;
+    }
+    if (line_gate_warned_no_ring_) {
+        RCLCPP_INFO(this->get_logger(),
+                    "线门闩: ring 字段已恢复，重新启用滑窗种子生长");
+        line_gate_warned_no_ring_ = false;
+    }
+
+    // 候选：小格已删 且 大格判留
+    std::vector<uint32_t> cand;
+    cand.reserve(256);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (drop[i] == 0) {
+            continue;
+        }
+        const Voxel* lv = (i < point_large.size()) ? point_large[i] : nullptr;
+        if (lv != nullptr && bad_large_set.count(lv) == 0) {
+            cand.push_back(i);
+        }
+    }
+    if (cand.empty()) {
+        if (n_restored_out) {
+            *n_restored_out = 0;
+        }
+        return;
+    }
+
+    std::unordered_map<int, std::vector<uint32_t>> by_ring;
+    by_ring.reserve(64);
+    for (uint32_t i : cand) {
+        const int ring = static_cast<int>(ring_of_cur_[i]);
+        by_ring[ring].push_back(i);
+    }
+
+    const double gap_k = line_gap_k_;
+    const double ang_h = std::max(ang_h_, 1e-6);
+    const int seed_win = seed_win_;
+    const double seed_rms = seed_rms_m_;
+    const double grow_pred = grow_pred_m_;
+    const int grow_min = grow_min_points_;
+
+    auto neigh_ok = [&](uint32_t a, uint32_t b) -> bool {
+        const auto& pa = cloud->points[a];
+        const auto& pb = cloud->points[b];
+        const double dx = static_cast<double>(pb.x) - pa.x;
+        const double dy = static_cast<double>(pb.y) - pa.y;
+        const double dz = static_cast<double>(pb.z) - pa.z;
+        const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double rxy = std::hypot(static_cast<double>(pb.x),
+                                     static_cast<double>(pb.y));
+        const double thr = std::max(gap_k * rxy * ang_h, 0.02);
+        return dist <= thr;
+    };
+
+    auto point_line_dist = [](const pcl::PointXYZ& p,
+                              double cx, double cy, double cz,
+                              double ux, double uy, double uz) -> double {
+        const double dx = p.x - cx;
+        const double dy = p.y - cy;
+        const double dz = p.z - cz;
+        const double cxu = dy * uz - dz * uy;
+        const double cyu = dz * ux - dx * uz;
+        const double czu = dx * uy - dy * ux;
+        return std::sqrt(cxu * cxu + cyu * cyu + czu * czu);
+    };
+
+    size_t n_seed = 0;
+    size_t n_seg = 0;
+    size_t n_grown_pts = 0;
+    std::vector<char> allow(n, 0);
+
+    for (auto& entry : by_ring) {
+        auto& idxs = entry.second;
+        if (idxs.empty()) {
+            continue;
+        }
+        std::sort(idxs.begin(), idxs.end(), [&](uint32_t a, uint32_t b) {
+            const auto& pa = cloud->points[a];
+            const auto& pb = cloud->points[b];
+            return std::atan2(pa.y, pa.x) < std::atan2(pb.y, pb.x);
+        });
+
+        const size_t m = idxs.size();
+        std::vector<char> used(m, 0);
+
+        for (size_t i = 0; i + static_cast<size_t>(seed_win) <= m; ++i) {
+            if (used[i]) {
+                continue;
+            }
+            bool gap_ok = true;
+            bool free_ok = true;
+            for (int t = 0; t < seed_win; ++t) {
+                if (used[i + static_cast<size_t>(t)]) {
+                    free_ok = false;
+                    break;
+                }
+            }
+            if (!free_ok) {
+                continue;
+            }
+            for (int t = 1; t < seed_win; ++t) {
+                if (!neigh_ok(idxs[i + static_cast<size_t>(t - 1)],
+                              idxs[i + static_cast<size_t>(t)])) {
+                    gap_ok = false;
+                    break;
+                }
+            }
+            if (!gap_ok) {
+                continue;
+            }
+
+            std::vector<uint32_t> win;
+            win.reserve(static_cast<size_t>(seed_win));
+            for (int t = 0; t < seed_win; ++t) {
+                win.push_back(idxs[i + static_cast<size_t>(t)]);
+            }
+            double cx = 0.0, cy = 0.0, cz = 0.0;
+            double ux = 0.0, uy = 0.0, uz = 0.0;
+            const float rms = lineFit3d(cloud, win, &cx, &cy, &cz, &ux, &uy, &uz);
+            if (rms < 0.0f || static_cast<double>(rms) > seed_rms) {
+                continue;
+            }
+            ++n_seed;
+
+            // 以种子为核向两侧生长
+            size_t left = i;
+            size_t right = i + static_cast<size_t>(seed_win) - 1;
+            std::vector<uint32_t> grown = win;
+
+            auto refit = [&]() -> bool {
+                const float r = lineFit3d(
+                    cloud, grown, &cx, &cy, &cz, &ux, &uy, &uz);
+                return r >= 0.0f;
+            };
+
+            while (right + 1 < m && !used[right + 1]) {
+                const uint32_t nxt = idxs[right + 1];
+                if (!neigh_ok(idxs[right], nxt)) {
+                    break;
+                }
+                if (point_line_dist(cloud->points[nxt], cx, cy, cz, ux, uy, uz)
+                    > grow_pred) {
+                    break;
+                }
+                grown.push_back(nxt);
+                ++right;
+                if (!refit()) {
+                    grown.pop_back();
+                    --right;
+                    break;
+                }
+            }
+            while (left > 0 && !used[left - 1]) {
+                const uint32_t prv = idxs[left - 1];
+                if (!neigh_ok(prv, idxs[left])) {
+                    break;
+                }
+                if (point_line_dist(cloud->points[prv], cx, cy, cz, ux, uy, uz)
+                    > grow_pred) {
+                    break;
+                }
+                grown.insert(grown.begin(), prv);
+                --left;
+                if (!refit()) {
+                    grown.erase(grown.begin());
+                    ++left;
+                    break;
+                }
+            }
+
+            if (static_cast<int>(grown.size()) < grow_min) {
+                continue;
+            }
+
+            ++n_seg;
+            n_grown_pts += grown.size();
+            for (size_t k = left; k <= right; ++k) {
+                used[k] = 1;
+                const uint32_t pi = idxs[k];
+                if (pi < n) {
+                    allow[pi] = 1;
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        if (allow[i] == 0 || drop[i] == 0) {
+            continue;
+        }
+        drop[i] = 0;
+        restored[i] = 1;
+        ++n_restored;
+    }
+
+    PT_INFO("线门闩: 候选 %zu 种子 %zu 段 %zu 生长点(含种子) %zu → 捞回点 %zu",
+            cand.size(), n_seed, n_seg, n_grown_pts, n_restored);
+    if (n_restored_out) {
+        *n_restored_out = n_restored;
     }
 }
 
@@ -1386,6 +1773,114 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
     }
     return bad;
+}
+
+// 团级诊断：把每个连通团(= RViz 标签上的 tN)的特征打一条日志，
+// 用于回答"这一团为什么被删 / 为什么被捞回"。
+// 倾斜角用最小二乘拟合 z = a*x + b*y + c 得到，|nz| = 1/sqrt(1+a^2+b^2)。
+void CloudPassthroughFilterNode::logClusterStats(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<char>& drop,
+    const std::vector<char>& restored) const
+{
+    if (!cloud || cloud->empty() || grid_.empty()) {
+        return;
+    }
+    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
+
+    std::unordered_map<int, std::vector<uint32_t>> by_cluster;
+    for (const auto& entry : grid_) {
+        const Voxel& v = entry.second;
+        if (v.cluster_id <= 0) {
+            continue;
+        }
+        auto& dst = by_cluster[v.cluster_id];
+        dst.insert(dst.end(), v.idx.begin(), v.idx.end());
+    }
+    if (by_cluster.empty()) {
+        return;
+    }
+
+    std::vector<int> ids;
+    ids.reserve(by_cluster.size());
+    for (const auto& kv : by_cluster) {
+        ids.push_back(kv.first);
+    }
+    std::sort(ids.begin(), ids.end());
+
+    for (int id : ids) {
+        const std::vector<uint32_t>& idx = by_cluster[id];
+        if (idx.empty()) {
+            continue;
+        }
+
+        double sx = 0.0, sy = 0.0, sz = 0.0;
+        float zmin = std::numeric_limits<float>::max();
+        float zmax = -zmin;
+        double rmin = std::numeric_limits<double>::max();
+        double rmax = 0.0;
+        size_t n_drop = 0;
+        size_t n_rest = 0;
+        std::unordered_set<int> rings;
+        for (uint32_t i : idx) {
+            if (i >= n) {
+                continue;
+            }
+            const auto& p = cloud->points[i];
+            sx += p.x;
+            sy += p.y;
+            sz += p.z;
+            zmin = std::min(zmin, p.z);
+            zmax = std::max(zmax, p.z);
+            const double rr = std::hypot(static_cast<double>(p.x), static_cast<double>(p.y));
+            rmin = std::min(rmin, rr);
+            rmax = std::max(rmax, rr);
+            rings.insert(ringOfPoint(i, p.x, p.y, p.z));
+            if (i < drop.size() && drop[i] != 0) {
+                ++n_drop;
+            }
+            if (i < restored.size() && restored[i] != 0) {
+                ++n_rest;
+            }
+        }
+
+        const double m = static_cast<double>(idx.size());
+        const double mx = sx / m;
+        const double my = sy / m;
+        const double mz = sz / m;
+
+        // 中心二阶矩，解正规方程得 z = a*x + b*y + c
+        double sxx = 0.0, sxy = 0.0, sxz = 0.0, syy = 0.0, syz = 0.0;
+        for (uint32_t i : idx) {
+            if (i >= n) {
+                continue;
+            }
+            const auto& p = cloud->points[i];
+            const double dx = static_cast<double>(p.x) - mx;
+            const double dy = static_cast<double>(p.y) - my;
+            const double dz = static_cast<double>(p.z) - mz;
+            sxx += dx * dx;
+            sxy += dx * dy;
+            sxz += dx * dz;
+            syy += dy * dy;
+            syz += dy * dz;
+        }
+        const double det = sxx * syy - sxy * sxy;
+        double tilt_deg = -1.0;  // <0 表示退化（接近竖直，拟合不出来）
+        double nz = 0.0;
+        if (std::fabs(det) > 1e-12) {
+            const double a = (sxz * syy - syz * sxy) / det;
+            const double b = (syz * sxx - sxz * sxy) / det;
+            nz = 1.0 / std::sqrt(1.0 + a * a + b * b);
+            tilt_deg = std::acos(std::min(1.0, nz)) * 180.0 / M_PI;
+        }
+
+        PT_INFO("团 t%d: 点数=%zu 覆盖线=%zu z跨=%.3f 径向=%.2f~%.2f "
+                "倾角=%.1f° |nz|=%.3f 被删=%zu 捞回=%zu 中心z=%.2f",
+                id, idx.size(), rings.size(),
+                static_cast<double>(zmax - zmin), rmin, rmax,
+                tilt_deg < 0.0 ? 90.0 : tilt_deg, nz, n_drop, n_rest, mz);
+    }
 }
 
 void CloudPassthroughFilterNode::removePointsInBadVoxels(
