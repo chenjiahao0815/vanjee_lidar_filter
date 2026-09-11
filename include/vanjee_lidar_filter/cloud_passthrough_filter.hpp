@@ -135,7 +135,7 @@ private:
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void flattenOccupiedVoxels();
     void buildNeighborTable();
-    // 邻接表并大格；边两端各自在同一xy柱上还有其他z格才并
+    // 邻接表并大格；enable_merge_z_check_ 开时，边两端各自在同一xy柱上还有其他z格才并
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
@@ -220,6 +220,7 @@ private:
     std::string thr_ratio_raw_;
     double thr_z_min_{0.03};
     bool enable_voxel_filter_{true};
+    bool enable_merge_z_check_{true};
     bool enable_small_cluster_filter_{true};
     int small_cluster_max_points_{10};
     double small_cluster_link_m_{0.15};

@@ -164,6 +164,7 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("base_z", 0.01);
     this->declare_parameter("thr_ratio", std::string("(0.0,2.0)"));
     this->declare_parameter("thr_z_min", 0.03);
+    this->declare_parameter("enable_merge_z_check", true);
     this->declare_parameter("enable_small_cluster_filter", true);
     this->declare_parameter("small_cluster_max_points", 10);
     this->declare_parameter("small_cluster_link_m", 0.15);
@@ -229,6 +230,7 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (thr_z_min_ < 0.0) {
         thr_z_min_ = 0.0;
     }
+    enable_merge_z_check_ = this->get_parameter("enable_merge_z_check").as_bool();
     enable_small_cluster_filter_ = this->get_parameter("enable_small_cluster_filter").as_bool();
     small_cluster_max_points_ = this->get_parameter("small_cluster_max_points").as_int();
     if (small_cluster_max_points_ < 1) {
@@ -368,7 +370,11 @@ void CloudPassthroughFilterNode::log_startup() const
                     ang_h_, ang_v_, base_x_, base_y_, base_z_,
                     thr_ratio_raw_.c_str(), thr_z_min_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 固定细格，26邻接且两端同柱另有z格才并大格，再按厚度删");
+                    "  删点: 固定细格，26邻接%s并大格，再按厚度删",
+                    enable_merge_z_check_ ? "且两端同柱另有z格才" : "直接");
+        RCLCPP_INFO(this->get_logger(),
+                    "  并边z检查: %s",
+                    enable_merge_z_check_ ? "开" : "关");
         RCLCPP_INFO(this->get_logger(), "  --- 门槛样例 ---");
         logVoxelScaleSamples();
     }
@@ -1023,31 +1029,38 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
             parent[static_cast<size_t>(b)] = a;
         }
     };
-    auto col_key = [](int ix, int iy) -> int64_t {
-        constexpr int64_t kOff = 1 << 20;
-        return ((static_cast<int64_t>(ix) + kOff) << 32) |
-               (static_cast<int64_t>(iy) + kOff);
-    };
-    std::unordered_map<int64_t, int> col_n;
-    col_n.reserve(static_cast<size_t>(n) * 2 + 1);
-    for (int i = 0; i < n; ++i) {
-        const Voxel& v = cells_[static_cast<size_t>(i)];
-        ++col_n[col_key(v.ix, v.iy)];
-    }
-    std::vector<char> z_ok(static_cast<size_t>(n), 0);
-    for (int i = 0; i < n; ++i) {
-        const Voxel& v = cells_[static_cast<size_t>(i)];
-        z_ok[static_cast<size_t>(i)] =
-            col_n[col_key(v.ix, v.iy)] >= 2 ? 1 : 0;
-    }
     size_t n_merge_edge = 0;
-    for (const NbrEdge& e : nbr_table_) {
-        if (z_ok[static_cast<size_t>(e.a)] == 0 ||
-            z_ok[static_cast<size_t>(e.b)] == 0) {
-            continue;
+    if (enable_merge_z_check_) {
+        auto col_key = [](int ix, int iy) -> int64_t {
+            constexpr int64_t kOff = 1 << 20;
+            return ((static_cast<int64_t>(ix) + kOff) << 32) |
+                   (static_cast<int64_t>(iy) + kOff);
+        };
+        std::unordered_map<int64_t, int> col_n;
+        col_n.reserve(static_cast<size_t>(n) * 2 + 1);
+        for (int i = 0; i < n; ++i) {
+            const Voxel& v = cells_[static_cast<size_t>(i)];
+            ++col_n[col_key(v.ix, v.iy)];
         }
-        unite(e.a, e.b);
-        ++n_merge_edge;
+        std::vector<char> z_ok(static_cast<size_t>(n), 0);
+        for (int i = 0; i < n; ++i) {
+            const Voxel& v = cells_[static_cast<size_t>(i)];
+            z_ok[static_cast<size_t>(i)] =
+                col_n[col_key(v.ix, v.iy)] >= 2 ? 1 : 0;
+        }
+        for (const NbrEdge& e : nbr_table_) {
+            if (z_ok[static_cast<size_t>(e.a)] == 0 ||
+                z_ok[static_cast<size_t>(e.b)] == 0) {
+                continue;
+            }
+            unite(e.a, e.b);
+            ++n_merge_edge;
+        }
+    } else {
+        for (const NbrEdge& e : nbr_table_) {
+            unite(e.a, e.b);
+            ++n_merge_edge;
+        }
     }
 
     std::unordered_map<int, std::vector<int>> comps;
@@ -1147,8 +1160,10 @@ void CloudPassthroughFilterNode::mergeFineVoxels()
         v.size_z = static_cast<float>(s.size_z);
         grid_.emplace(static_cast<int64_t>(cluster_n), std::move(v));
     }
-    PT_INFO("邻接并格: 细格 %d, 邻边 %zu, 同柱z支撑并边 %zu, 大格 %zu",
-            n, nbr_table_.size(), n_merge_edge, grid_.size());
+    PT_INFO("邻接并格: 细格 %d, 邻边 %zu, %s并边 %zu, 大格 %zu",
+            n, nbr_table_.size(),
+            enable_merge_z_check_ ? "同柱z支撑" : "26邻接",
+            n_merge_edge, grid_.size());
 }
 
 int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
