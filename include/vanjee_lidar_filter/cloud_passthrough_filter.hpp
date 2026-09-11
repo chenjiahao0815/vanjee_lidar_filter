@@ -42,7 +42,7 @@ struct AxisSpec {
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_pub;
 };
 
-// 按当前距离和角分辨率算出来的一格尺寸与删点门槛
+// 细格固定边长；thr_z 可随距离用线间距缩放
 struct VoxelScale {
     int mult_xy{1};
     int mult_z{1};
@@ -55,7 +55,7 @@ struct VoxelScale {
     double inv_z{0.0};
 };
 
-// XY 分段倍率
+// thr_ratio 等分段表
 struct SizeXyBand {
     double split_r{0.0};
     double ratio{1.0};
@@ -75,14 +75,21 @@ struct Voxel {
     float size_xy{0.0f};
     float size_z{0.0f};
     float cell_sx{0.0f};
+    float cell_sy{0.0f};
     float cell_sz{0.0f};
-    int merge_nxy{1};  // 合进本格时用的横向倍率
+    int merge_nx{1};
+    int merge_ny{1};
     int merge_nz{1};
     uint64_t ring_mask{0};
     std::vector<uint32_t> idx;
     int cluster_id{0};  // 连通团编号，0=未成团/单格；可视化/日志用
     int cell_id{0};     // 本帧体素格子编号，可视化/删点日志对照用
-    bool restored{false};  // 小格本判删、大格捞回：青框可视化
+};
+
+// 26邻接表的一条无向边，建一次后续遍历直接用
+struct NbrEdge {
+    int a{0};
+    int b{0};
 };
 
 class CloudPassthroughFilterNode : public rclcpp::Node {
@@ -122,21 +129,28 @@ private:
     void logVoxelScaleSamples() const;
     VoxelScale computeVoxelScale(double r) const;
     bool parseSizeXyBands(const std::string& text, std::vector<SizeXyBand>& out) const;
-    double lookupSizeXyRatio(double r_xy) const;
-    double lookupSizeZRatio(double r_xy) const;
     double lookupThrRatio(double r_xy) const;
     bool inOurCube(float x, float y, float z) const;
     bool inPassthrough(float x, float y, float z) const;
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
+    void flattenOccupiedVoxels();
+    void buildNeighborTable();
+    // 用邻接表并成大格，斜墙被切开的细格连回去再判厚度
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
-    void assignClusters(std::vector<Voxel*>& all);
-    void useSizeXyBands(int which);  // 1=小格 2=大格
     void removePointsInBadVoxels(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<Voxel*>& bad_voxels,
         const std_msgs::msg::Header& header);
+    void markDropFromBadVoxels(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<Voxel*>& bad_voxels,
+        std::vector<char>& drop);
+    // 体素删完后，对框内留下的点再聚一次；整团点数不超过门槛当残渣删
+    void markSmallPointClusters(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        std::vector<char>& drop);
     void removePointsByMask(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
         const std::vector<char>& drop,
@@ -146,11 +160,8 @@ private:
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
         const std::vector<Voxel*>& bad_voxels,
         const std_msgs::msg::Header& header,
-        const std::vector<char>* drop_mask = nullptr,
-        const std::vector<char>* restored_mask = nullptr);
+        const std::vector<char>* drop_mask = nullptr);
     int64_t makeKey(int ix, int iy, int iz) const;
-    int64_t makeCoarseKey(int ox, int oy, int oz, int nxy, int nz) const;
-    int floorDiv(int a, int b) const;
     int ringId(float x, float y, float z) const;
     // 优先用 ring_of_cur_[i] 里的真实线号，缺失时退回 atan2 几何估计
     int ringOfPoint(uint32_t i, float x, float y, float z) const;
@@ -197,38 +208,28 @@ private:
     double cube_min_z_{-1.0};
     double cube_max_z_{1.0};
 
-    // 体素参数：边长 = 默认值 × 整数倍率；倍率由距离×角分辨率相对默认值向上取整
+    // 体素参数：细格固定 base_x/base_y/base_z，不随距离放大
     double ang_h_{0.0};
     double ang_v_{0.0};
     double r_max_{8.0};
-    double base_xy_{0.01};
+    double base_x_{0.01};
+    double base_y_{0.01};
     double base_z_{0.01};
-    double max_xy_{0.5};
-    double max_z_{0.5};
-    // 横向边长 = base_xy × 分段倍率，再夹在 [base_xy, max_xy]
-    // bands1=小格先删；bands2=大格用整云再判，捞回小格误删点
-    std::vector<SizeXyBand> size_xy_bands_;       // 当前生效（build/lookup 用）
-    std::string size_xy_bands_raw_;
-    std::vector<SizeXyBand> size_xy_bands1_;
-    std::string size_xy_bands1_raw_;
-    std::vector<SizeXyBand> size_xy_bands2_;
-    std::string size_xy_bands2_raw_;
-    // 纵向边长 = size_z_bands(r) × 线间距；bands 空则退回 size_z_ratio
-    std::vector<SizeXyBand> size_z_bands_;
-    std::string size_z_bands_raw_;
-    double size_z_ratio_{4.0};
-    double size_z_min_{0.1};
     // thr_z = thr_ratio(r) × 线间距；参数名仍叫 thr_ratio，格式同 bands
     std::vector<SizeXyBand> thr_ratio_bands_;
     std::string thr_ratio_raw_;
     double thr_z_min_{0.03};
-    double cluster_link_m_{0.18};
-    double cluster_link_k_{6.0};
-    double cluster_plane_k_{10.0};
     bool enable_voxel_filter_{true};
+    bool enable_small_cluster_filter_{true};
+    int small_cluster_max_points_{10};
+    double small_cluster_link_m_{0.15};
 
     std::unordered_map<int64_t, Voxel> grid_;
     std::unordered_map<int64_t, Voxel> fine_grid_;
+    std::vector<Voxel> cells_;
+    std::unordered_map<int64_t, int> key_to_idx_;
+    std::vector<NbrEdge> nbr_table_;
+    std::vector<std::vector<int>> nbrs_;
 
     // 与当前工作点云逐点对齐的真实线号；空表示这帧没有 ring 字段
     std::vector<uint16_t> ring_of_cur_;

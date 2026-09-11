@@ -159,23 +159,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("ang_h", 0.0034906585);   // 约 0.2 deg
     this->declare_parameter("ang_v", 0.0174532925);   // 约 1.0 deg
     this->declare_parameter("r_max", 8.0);
-    this->declare_parameter("base_xy", 0.01);
+    this->declare_parameter("base_x", 0.01);
+    this->declare_parameter("base_y", 0.01);
     this->declare_parameter("base_z", 0.01);
-    this->declare_parameter("max_xy", 0.5);
-    this->declare_parameter("max_z", 0.5);
-    this->declare_parameter(
-        "size_xy_bands1", std::string("(1.0,4.0),(2.0,8.0),(3.0,12.0)"));
-    this->declare_parameter(
-        "size_xy_bands2", std::string("(1.0,20.0),(2.0,22.0),(3.0,14.0)"));
-    this->declare_parameter(
-        "size_z_bands", std::string("(1.0,3.0),(2.0,4.0),(3.0,5.0)"));
-    this->declare_parameter("size_z_ratio", 4.0);
-    this->declare_parameter("size_z_min", 0.1);
     this->declare_parameter("thr_ratio", std::string("(0.0,2.0)"));
     this->declare_parameter("thr_z_min", 0.03);
-    this->declare_parameter("cluster_link_m", 0.18);
-    this->declare_parameter("cluster_link_k", 6.0);
-    this->declare_parameter("cluster_plane_k", 10.0);
+    this->declare_parameter("enable_small_cluster_filter", true);
+    this->declare_parameter("small_cluster_max_points", 10);
+    this->declare_parameter("small_cluster_link_m", 0.15);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -223,42 +214,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     ang_h_ = this->get_parameter("ang_h").as_double();
     ang_v_ = this->get_parameter("ang_v").as_double();
     r_max_ = this->get_parameter("r_max").as_double();
-    base_xy_ = this->get_parameter("base_xy").as_double();
+    base_x_ = this->get_parameter("base_x").as_double();
+    base_y_ = this->get_parameter("base_y").as_double();
     base_z_ = this->get_parameter("base_z").as_double();
-    max_xy_ = this->get_parameter("max_xy").as_double();
-    max_z_ = this->get_parameter("max_z").as_double();
-    auto loadXyBands = [&](const char* name,
-                           std::string& raw,
-                           std::vector<SizeXyBand>& bands) {
-        raw = this->get_parameter(name).as_string();
-        if (!parseSizeXyBands(raw, bands)) {
-            RCLCPP_WARN(this->get_logger(),
-                        "%s 解析失败: '%s'，退回全程倍率 1.0",
-                        name, raw.c_str());
-            bands.clear();
-            bands.push_back(SizeXyBand{1.0e9, 1.0});
-        }
-    };
-    loadXyBands("size_xy_bands1", size_xy_bands1_raw_, size_xy_bands1_);
-    loadXyBands("size_xy_bands2", size_xy_bands2_raw_, size_xy_bands2_);
-    useSizeXyBands(1);
-    size_z_bands_raw_ = this->get_parameter("size_z_bands").as_string();
-    size_z_bands_.clear();
-    if (!size_z_bands_raw_.empty() &&
-        !parseSizeXyBands(size_z_bands_raw_, size_z_bands_)) {
-        RCLCPP_WARN(this->get_logger(),
-                    "size_z_bands 解析失败: '%s'，退回 size_z_ratio",
-                    size_z_bands_raw_.c_str());
-        size_z_bands_.clear();
-    }
-    size_z_ratio_ = this->get_parameter("size_z_ratio").as_double();
-    if (size_z_ratio_ <= 0.0) {
-        size_z_ratio_ = 4.0;
-    }
-    size_z_min_ = this->get_parameter("size_z_min").as_double();
-    if (size_z_min_ <= 0.0) {
-        size_z_min_ = 0.1;
-    }
     thr_ratio_raw_ = this->get_parameter("thr_ratio").as_string();
     if (!parseSizeXyBands(thr_ratio_raw_, thr_ratio_bands_)) {
         RCLCPP_WARN(this->get_logger(),
@@ -271,17 +229,14 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (thr_z_min_ < 0.0) {
         thr_z_min_ = 0.0;
     }
-    cluster_link_m_ = this->get_parameter("cluster_link_m").as_double();
-    cluster_link_k_ = this->get_parameter("cluster_link_k").as_double();
-    cluster_plane_k_ = this->get_parameter("cluster_plane_k").as_double();
-    if (cluster_link_m_ <= 0.0) {
-        cluster_link_m_ = 0.18;
+    enable_small_cluster_filter_ = this->get_parameter("enable_small_cluster_filter").as_bool();
+    small_cluster_max_points_ = this->get_parameter("small_cluster_max_points").as_int();
+    if (small_cluster_max_points_ < 1) {
+        small_cluster_max_points_ = 10;
     }
-    if (cluster_link_k_ <= 0.0) {
-        cluster_link_k_ = 6.0;
-    }
-    if (cluster_plane_k_ <= 0.0) {
-        cluster_plane_k_ = 10.0;
+    small_cluster_link_m_ = this->get_parameter("small_cluster_link_m").as_double();
+    if (small_cluster_link_m_ <= 0.0) {
+        small_cluster_link_m_ = 0.15;
     }
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
@@ -407,23 +362,20 @@ void CloudPassthroughFilterNode::log_startup() const
                     cube_min_y_, cube_max_y_,
                     cube_min_z_, cube_max_z_);
         RCLCPP_INFO(this->get_logger(),
-                    "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格 base_xy=%.3f base_z=%.3f, "
-                    "横向 bands1(先删)=%s bands2(再捞)=%s 夹[%.3f,%.3f] "
-                    "纵向 bands=%s (空则×%.1f) ×线间距夹[%.3f,%.3f], "
-                    "thr_ratio=%s thr_z_min=%.3f, "
-                    "连通团 link=%.2f m k3d=%.1f k_xy=%.1f",
-                    ang_h_, ang_v_, base_xy_, base_z_,
-                    size_xy_bands1_raw_.c_str(), size_xy_bands2_raw_.c_str(),
-                    base_xy_, max_xy_,
-                    size_z_bands_raw_.c_str(), size_z_ratio_,
-                    size_z_min_, max_z_,
-                    thr_ratio_raw_.c_str(), thr_z_min_,
-                    cluster_link_m_, cluster_link_k_, cluster_plane_k_);
+                    "  角分辨率 ang_h=%.6f ang_v=%.6f, 细格固定 "
+                    "base_x=%.3f base_y=%.3f base_z=%.3f, "
+                    "thr_ratio=%s thr_z_min=%.3f",
+                    ang_h_, ang_v_, base_x_, base_y_, base_z_,
+                    thr_ratio_raw_.c_str(), thr_z_min_);
         RCLCPP_INFO(this->get_logger(),
-                    "  删点: 小格厚度先删，大格整云再判，大格留则捞回");
-        RCLCPP_INFO(this->get_logger(), "  --- bands1 样例(启动默认) ---");
+                    "  删点: 固定细格，建26邻接表后并大格，再按厚度删");
+        RCLCPP_INFO(this->get_logger(), "  --- 门槛样例 ---");
         logVoxelScaleSamples();
     }
+    RCLCPP_INFO(this->get_logger(),
+                "  小团清扫: %s  团点数≤%d  link=%.3f m",
+                enable_small_cluster_filter_ ? "开" : "关",
+                small_cluster_max_points_, small_cluster_link_m_);
 }
 
 bool CloudPassthroughFilterNode::shouldFrameLog() const
@@ -676,115 +628,35 @@ void CloudPassthroughFilterNode::cloud_callback(
     // 直通滤波到这里结束，current 是直通后的点云
 
     std::vector<Voxel*> bad_voxels;
+    std::vector<char> drop;
+    const size_t n_before_voxel = (current && !current->empty()) ? current->size() : 0;
     if (enable_voxel_filter_ && current && !current->empty()) {
-        const size_t n_before_voxel = current->size();
-        const uint32_t n = static_cast<uint32_t>(current->points.size());
-
-        // 1) 小格：原生成逻辑 + bands1 → 先标删
-        useSizeXyBands(1);
         grid_.clear();
         fine_grid_.clear();
+        cells_.clear();
+        key_to_idx_.clear();
+        nbr_table_.clear();
+        nbrs_.clear();
         buildVoxelGrid(current);
-        const std::vector<Voxel*> bad_small = collectBadVoxels();
-
-        std::vector<char> drop(n, 0);
-        std::vector<char> restored(n, 0);
-        size_t marked_small = 0;
-        for (const Voxel* v : bad_small) {
-            if (!v) {
-                continue;
-            }
-            for (uint32_t idx : v->idx) {
-                if (idx < n && drop[idx] == 0) {
-                    drop[idx] = 1;
-                    ++marked_small;
-                }
-            }
+        bad_voxels = collectBadVoxels();
+        drop.assign(current->points.size(), 0);
+        markDropFromBadVoxels(current, bad_voxels, drop);
+    }
+    if (enable_small_cluster_filter_ && current && !current->empty()) {
+        if (drop.size() != current->points.size()) {
+            drop.assign(current->points.size(), 0);
         }
-
-        // 小格网格留给可视化；大格另算
-        auto small_grid = std::move(grid_);
-        fine_grid_.clear();
-
-        // 2) 大格：同一朵原云 + bands2（不是只拿已删点划格）
-        useSizeXyBands(2);
-        grid_.clear();
-        buildVoxelGrid(current);
-        const std::vector<Voxel*> bad_large = collectBadVoxels();
-        std::unordered_set<const Voxel*> bad_large_set;
-        bad_large_set.reserve(bad_large.size() * 2 + 1);
-        for (const Voxel* v : bad_large) {
-            if (v) {
-                bad_large_set.insert(v);
-            }
-        }
-
-        std::vector<Voxel*> point_large(n, nullptr);
-        for (auto& entry : grid_) {
-            Voxel* vp = &entry.second;
-            for (uint32_t idx : vp->idx) {
-                if (idx < n) {
-                    point_large[idx] = vp;
-                }
-            }
-        }
-
-        // 3) 小格删了的点：若所在大格判留 → 捞回
-        size_t n_restored = 0;
-        for (uint32_t i = 0; i < n; ++i) {
-            if (drop[i] == 0) {
-                continue;
-            }
-            const Voxel* lv = point_large[i];
-            if (lv != nullptr && bad_large_set.count(lv) == 0) {
-                drop[i] = 0;
-                restored[i] = 1;
-                ++n_restored;
-            }
-        }
-
-        // 可视化仍用小格；标记捞回格，最终坏格=仍要删的点所在格
-        grid_ = std::move(small_grid);
-        useSizeXyBands(1);
-        bad_voxels.clear();
-        bad_voxels.reserve(bad_small.size());
-        for (auto& entry : grid_) {
-            Voxel& v = entry.second;
-            v.restored = false;
-            bool any_drop = false;
-            bool any_restored = false;
-            for (uint32_t idx : v.idx) {
-                if (idx >= n) {
-                    continue;
-                }
-                if (drop[idx] != 0) {
-                    any_drop = true;
-                }
-                if (restored[idx] != 0) {
-                    any_restored = true;
-                }
-            }
-            if (any_restored) {
-                v.restored = true;
-            }
-            if (any_drop) {
-                bad_voxels.push_back(&v);
-            }
-        }
-
-        PT_INFO("双尺度: 小格标删 %zu 点, 大格捞回 %zu 点, 最终删格 %zu",
-                marked_small, n_restored, bad_voxels.size());
-
-        if (debug_mode_) {
-            publishFilterDebug(raw_viz, current, bad_voxels, msg->header,
-                               &drop, &restored);
-        }
+        markSmallPointClusters(current, drop);
+    }
+    if (debug_mode_) {
+        publishFilterDebug(raw_viz, current, bad_voxels, msg->header,
+                           drop.empty() ? nullptr : &drop);
+    }
+    if (!drop.empty()) {
         removePointsByMask(current, drop, msg->header);
         PT_INFO("体素删点结束: 坏格 %zu, 点数 %zu → %zu",
                 bad_voxels.size(), n_before_voxel, current->size());
-    } else if (debug_mode_) {
-        publishFilterDebug(raw_viz, current, bad_voxels, msg->header);
-        }
+    }
 
         publish_cloud(current, msg->header, publisher_, "最终输出");
     if (raw_viz) {
@@ -800,54 +672,38 @@ void CloudPassthroughFilterNode::cloud_callback(
 
 // ---------- 体素删点 ----------
 
-void CloudPassthroughFilterNode::useSizeXyBands(int which)
-{
-    if (which == 2) {
-        size_xy_bands_ = size_xy_bands2_;
-        size_xy_bands_raw_ = size_xy_bands2_raw_;
-    } else {
-        size_xy_bands_ = size_xy_bands1_;
-        size_xy_bands_raw_ = size_xy_bands1_raw_;
-    }
-}
-
 void CloudPassthroughFilterNode::logVoxelScaleSamples() const
 {
     const double samples[] = {1.0, 2.0, 4.0, std::max(r_max_, 1.0)};
     for (double r : samples) {
         const VoxelScale s = computeVoxelScale(r);
         RCLCPP_INFO(this->get_logger(),
-                    "  样例 r=%.1f xy_ratio=%.2f z_ratio=%.2f thr_ratio=%.2f "
-                    "line_gap=%.4f mult_xy=%d mult_z=%d size_xy=%.3f size_z=%.3f thr_z=%.4f",
-                    r, lookupSizeXyRatio(r), lookupSizeZRatio(r), lookupThrRatio(r),
-                    s.line_gap, s.mult_xy, s.mult_z, s.size_xy, s.size_z, s.thr_z);
+                    "  样例 r=%.1f thr_ratio=%.2f "
+                    "line_gap=%.4f size_x=%.3f size_y=%.3f size_z=%.3f thr_z=%.4f",
+                    r, lookupThrRatio(r),
+                    s.line_gap, base_x_, base_y_, s.size_z, s.thr_z);
     }
 }
 
 VoxelScale CloudPassthroughFilterNode::computeVoxelScale(double r) const
 {
-    VoxelScale s;  //输入和基础值保护      根据点云距离雷达的远近来决定用多大的体素来装点云
+    VoxelScale s;
     const double rr = std::max(r, 1e-3);
-    const double base_xy = std::max(base_xy_, 1e-6);
+    const double base_x = std::max(base_x_, 1e-6);
+    const double base_y = std::max(base_y_, 1e-6);
     const double base_z = std::max(base_z_, 1e-6);
 
     s.line_gap = rr * ang_v_;
     s.pt_gap = s.line_gap;
-    const double xy_ratio = lookupSizeXyRatio(rr);
-    const double z_ratio = lookupSizeZRatio(rr);
-    s.size_xy = std::min(std::max(base_xy * xy_ratio, base_xy), max_xy_);
-    s.size_z = std::min(std::max(z_ratio * s.line_gap, size_z_min_), max_z_);
-    s.mult_xy = static_cast<int>(std::max(1.0, std::ceil(s.size_xy / base_xy - 1e-12)));
-    s.mult_z = static_cast<int>(std::max(1.0, std::ceil(s.size_z / base_z - 1e-12)));
-    s.size_xy = std::min(base_xy * static_cast<double>(s.mult_xy), max_xy_);
-    s.size_z = std::min(base_z * static_cast<double>(s.mult_z), max_z_);
+
+    s.size_xy = std::max(base_x, base_y);
+    s.size_z = base_z;
+    s.mult_xy = 1;
+    s.mult_z = 1;
 
     s.thr_z = s.line_gap * lookupThrRatio(rr);
     if (s.thr_z < thr_z_min_) {
         s.thr_z = thr_z_min_;
-    }
-    if (s.thr_z > s.size_z) {
-        s.thr_z = s.size_z;
     }
 
     s.inv_xy = 1.0 / std::max(s.size_xy, 1e-6);
@@ -960,42 +816,6 @@ bool CloudPassthroughFilterNode::parseSizeXyBands(
     return true;
 }
 
-double CloudPassthroughFilterNode::lookupSizeXyRatio(double r_xy) const
-{
-    if (size_xy_bands_.empty()) {
-        return 1.0;
-    }
-    const double r = std::max(r_xy, 0.0);
-    // (起始距离, 倍率)：取最后一个 split_r ≤ r 的段；比第一段还近 → 不扩大
-    double ratio = 1.0;
-    for (const auto& band : size_xy_bands_) {
-        if (r >= band.split_r) {
-            ratio = band.ratio;
-        } else {
-            break;
-        }
-    }
-    return ratio;
-}
-
-double CloudPassthroughFilterNode::lookupSizeZRatio(double r_xy) const
-{
-    // bands 空：退回常数 size_z_ratio；有 bands：与 XY 相同分段语义
-    if (size_z_bands_.empty()) {
-        return size_z_ratio_;
-    }
-    const double r = std::max(r_xy, 0.0);
-    double ratio = 1.0;
-    for (const auto& band : size_z_bands_) {
-        if (r >= band.split_r) {
-            ratio = band.ratio;
-        } else {
-            break;
-        }
-    }
-    return ratio;
-}
-
 double CloudPassthroughFilterNode::lookupThrRatio(double r_xy) const
 {
     if (thr_ratio_bands_.empty()) {
@@ -1042,7 +862,8 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
     }
 
     // 只把落在立方体里的点装进细格；框外的点不做操作，后面原样留下
-    const double inv_xy = 1.0 / std::max(base_xy_, 1e-6);
+    const double inv_x = 1.0 / std::max(base_x_, 1e-6);
+    const double inv_y = 1.0 / std::max(base_y_, 1e-6);
     const double inv_z = 1.0 / std::max(base_z_, 1e-6);
     const uint32_t n = static_cast<uint32_t>(cloud->points.size());
     uint32_t loaded = 0;
@@ -1059,8 +880,8 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
             continue;
         }
 
-        const int ix = static_cast<int>(std::floor(static_cast<double>(p.x) * inv_xy));
-        const int iy = static_cast<int>(std::floor(static_cast<double>(p.y) * inv_xy));
+        const int ix = static_cast<int>(std::floor(static_cast<double>(p.x) * inv_x));
+        const int iy = static_cast<int>(std::floor(static_cast<double>(p.y) * inv_y));
         const int iz = static_cast<int>(std::floor(static_cast<double>(p.z) * inv_z));
         const int64_t key = makeKey(ix, iy, iz);
 
@@ -1073,8 +894,8 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
             v.count = 1;
             v.zmin = p.z;
             v.zmax = p.z;
-            v.cx = static_cast<float>((static_cast<double>(ix) + 0.5) * base_xy_);
-            v.cy = static_cast<float>((static_cast<double>(iy) + 0.5) * base_xy_);
+            v.cx = static_cast<float>((static_cast<double>(ix) + 0.5) * base_x_);
+            v.cy = static_cast<float>((static_cast<double>(iy) + 0.5) * base_y_);
             v.idx.push_back(i);
             addRing(v, i, p.x, p.y, p.z);
             fine_grid_.emplace(key, std::move(v));
@@ -1093,126 +914,216 @@ void CloudPassthroughFilterNode::buildVoxelGrid(
         ++loaded;
     }
 
+    flattenOccupiedVoxels();
+    buildNeighborTable();
     mergeFineVoxels();
     int cell_n = 0;
     for (auto& entry : grid_) {
         entry.second.cell_id = ++cell_n;
     }
-    PT_INFO("体素装格: 框内 %u 点, 框外跳过 %u, 细格 %zu, 合成后 %zu 格",
-            loaded, skipped_outside, fine_grid_.size(), grid_.size());
+    PT_INFO("体素装格: 框内 %u 点, 框外跳过 %u, 有点细格 %zu, 邻接边 %zu, 并后大格 %zu",
+            loaded, skipped_outside, cells_.size(), nbr_table_.size(), grid_.size());
 }
 
-void CloudPassthroughFilterNode::mergeFineVoxels()
+void CloudPassthroughFilterNode::flattenOccupiedVoxels()
 {
-    struct ScaleN {
-        int nxy{1};
-        int nz{1};
-    };
-    std::unordered_map<int64_t, ScaleN> scale_n;
-    scale_n.reserve(fine_grid_.size());
+    cells_.clear();
+    key_to_idx_.clear();
+    cells_.reserve(fine_grid_.size());
+    key_to_idx_.reserve(fine_grid_.size() * 2 + 1);
+    for (auto& entry : fine_grid_) {
+        Voxel v = std::move(entry.second);
+        const double cx = (static_cast<double>(v.ix) + 0.5) * base_x_;
+        const double cy = (static_cast<double>(v.iy) + 0.5) * base_y_;
+        const float cell_r = static_cast<float>(std::hypot(cx, cy));
+        const VoxelScale s = computeVoxelScale(static_cast<double>(cell_r));
+        v.cx = static_cast<float>(cx);
+        v.cy = static_cast<float>(cy);
+        v.r = cell_r;
+        v.cell_sx = static_cast<float>(std::max(base_x_, 1e-6));
+        v.cell_sy = static_cast<float>(std::max(base_y_, 1e-6));
+        v.cell_sz = static_cast<float>(std::max(base_z_, 1e-6));
+        v.merge_nx = 1;
+        v.merge_ny = 1;
+        v.merge_nz = 1;
+        v.thr_z = static_cast<float>(s.thr_z);
+        v.size_xy = static_cast<float>(s.size_xy);
+        v.size_z = static_cast<float>(s.size_z);
+        v.cluster_id = 0;
+        const int idx = static_cast<int>(cells_.size());
+        key_to_idx_.emplace(entry.first, idx);
+        cells_.push_back(std::move(v));
+    }
+    fine_grid_.clear();
+}
 
-    for (const auto& entry : fine_grid_) {
-        const Voxel& v = entry.second;
-        const double cx = (static_cast<double>(v.ix) + 0.5) * base_xy_;
-        const double cy = (static_cast<double>(v.iy) + 0.5) * base_xy_;
-        const double r = std::hypot(cx, cy);
-        const VoxelScale s = computeVoxelScale(r);
-        scale_n[entry.first] = ScaleN{s.mult_xy, s.mult_z};
+void CloudPassthroughFilterNode::buildNeighborTable()
+{
+    nbr_table_.clear();
+    nbrs_.clear();
+    const int n = static_cast<int>(cells_.size());
+    nbrs_.assign(static_cast<size_t>(n), {});
+    if (n == 0) {
+        return;
     }
 
-    for (auto& entry : fine_grid_) {
-        const Voxel& fine = entry.second;
-        ScaleN n = scale_n[entry.first];
-
+    nbr_table_.reserve(static_cast<size_t>(n) * 13);
+    for (int i = 0; i < n; ++i) {
+        const Voxel& v = cells_[static_cast<size_t>(i)];
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dz = -1; dz <= 1; ++dz) {
                     if (dx == 0 && dy == 0 && dz == 0) {
                         continue;
                     }
-                    const int64_t nk = makeKey(fine.ix + dx, fine.iy + dy, fine.iz + dz);
-                    auto nit = scale_n.find(nk);
-                    if (nit == scale_n.end()) {
+                    const int64_t nk = makeKey(v.ix + dx, v.iy + dy, v.iz + dz);
+                    const auto nit = key_to_idx_.find(nk);
+                    if (nit == key_to_idx_.end()) {
                         continue;
                     }
-                    if (nit->second.nxy > n.nxy) {
-                        n.nxy = nit->second.nxy;
+                    const int j = nit->second;
+                    if (j <= i) {
+                        continue;
                     }
-                    if (nit->second.nz > n.nz) {
-                        n.nz = nit->second.nz;
-                    }
+                    nbr_table_.push_back(NbrEdge{i, j});
                 }
             }
         }
-
-        const int nxy = std::max(1, n.nxy);
-        const int nz = std::max(1, n.nz);
-        // 键用细格角点，不是 floor(ix/n)；后者不同倍率会撞成同一格
-        const int origin_ix = floorDiv(fine.ix, nxy) * nxy;
-        const int origin_iy = floorDiv(fine.iy, nxy) * nxy;
-        const int origin_iz = floorDiv(fine.iz, nz) * nz;
-        const int64_t ckey = makeCoarseKey(origin_ix, origin_iy, origin_iz, nxy, nz);
-
-        const double cell_sx_d = std::min(base_xy_ * static_cast<double>(nxy), max_xy_);
-        const double cell_sz_d = std::min(base_z_ * static_cast<double>(nz), max_z_);
-        const float cell_sx = static_cast<float>(std::max(cell_sx_d, base_xy_));
-        const float cell_sz = static_cast<float>(std::max(cell_sz_d, base_z_));
-        const double cube_cx = static_cast<double>(origin_ix) * base_xy_ + 0.5 * cell_sx_d;
-        const double cube_cy = static_cast<double>(origin_iy) * base_xy_ + 0.5 * cell_sx_d;
-        const float cell_r = static_cast<float>(std::hypot(cube_cx, cube_cy));
-
-        auto it = grid_.find(ckey);
-        if (it == grid_.end()) {
-            Voxel v;
-            v.ix = origin_ix;
-            v.iy = origin_iy;
-            v.iz = origin_iz;
-            v.count = fine.count;
-            v.zmin = fine.zmin;
-            v.zmax = fine.zmax;
-            v.r = cell_r;
-            v.cx = static_cast<float>(cube_cx);
-            v.cy = static_cast<float>(cube_cy);
-            v.cell_sx = cell_sx;
-            v.cell_sz = cell_sz;
-            v.ring_mask = fine.ring_mask;
-            v.idx = fine.idx;
-            v.merge_nxy = nxy;
-            v.merge_nz = nz;
-            grid_.emplace(ckey, std::move(v));
-        } else {
-            Voxel& v = it->second;
-            v.count += fine.count;
-            if (fine.zmin < v.zmin) {
-                v.zmin = fine.zmin;
-            }
-            if (fine.zmax > v.zmax) {
-                v.zmax = fine.zmax;
-            }
-            if (cell_r > v.r) {
-                v.r = cell_r;
-            }
-            v.ring_mask |= fine.ring_mask;
-            v.idx.insert(v.idx.end(), fine.idx.begin(), fine.idx.end());
-        }
     }
-
-    for (auto& entry : grid_) {
-        Voxel& v = entry.second;
-        const VoxelScale s = computeVoxelScale(static_cast<double>(v.r));
-        v.thr_z = static_cast<float>(s.thr_z);
-        v.size_xy = static_cast<float>(s.size_xy);
-        v.size_z = static_cast<float>(s.size_z);
+    for (const NbrEdge& e : nbr_table_) {
+        nbrs_[static_cast<size_t>(e.a)].push_back(e.b);
+        nbrs_[static_cast<size_t>(e.b)].push_back(e.a);
     }
 }
 
-int CloudPassthroughFilterNode::floorDiv(int a, int b) const
+void CloudPassthroughFilterNode::mergeFineVoxels()
 {
-    const int d = std::max(b, 1);
-    if (a >= 0) {
-        return a / d;
+    grid_.clear();
+    const int n = static_cast<int>(cells_.size());
+    if (n == 0) {
+        return;
     }
-    return static_cast<int>(std::floor(static_cast<double>(a) / static_cast<double>(d)));
+
+    std::vector<int> parent(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        parent[static_cast<size_t>(i)] = i;
+    }
+    auto find = [&](int x) {
+        while (parent[static_cast<size_t>(x)] != x) {
+            parent[static_cast<size_t>(x)] =
+                parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+            x = parent[static_cast<size_t>(x)];
+        }
+        return x;
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) {
+            parent[static_cast<size_t>(b)] = a;
+        }
+    };
+    for (const NbrEdge& e : nbr_table_) {
+        unite(e.a, e.b);
+    }
+
+    std::unordered_map<int, std::vector<int>> comps;
+    comps.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        comps[find(i)].push_back(i);
+    }
+
+    int cluster_n = 0;
+    for (auto& ce : comps) {
+        ++cluster_n;
+        const std::vector<int>& members = ce.second;
+        if (members.empty()) {
+            continue;
+        }
+
+        const Voxel& seed = cells_[static_cast<size_t>(members[0])];
+        int min_ix = seed.ix, max_ix = seed.ix;
+        int min_iy = seed.iy, max_iy = seed.iy;
+        int min_iz = seed.iz, max_iz = seed.iz;
+        float zmin = seed.zmin;
+        float zmax = seed.zmax;
+        uint32_t count = 0;
+        uint64_t ring_mask = 0;
+        std::vector<uint32_t> idx;
+        idx.reserve(members.size() * 4);
+
+        for (int mi : members) {
+            Voxel& fine = cells_[static_cast<size_t>(mi)];
+            fine.cluster_id = cluster_n;
+            if (fine.ix < min_ix) {
+                min_ix = fine.ix;
+            }
+            if (fine.ix > max_ix) {
+                max_ix = fine.ix;
+            }
+            if (fine.iy < min_iy) {
+                min_iy = fine.iy;
+            }
+            if (fine.iy > max_iy) {
+                max_iy = fine.iy;
+            }
+            if (fine.iz < min_iz) {
+                min_iz = fine.iz;
+            }
+            if (fine.iz > max_iz) {
+                max_iz = fine.iz;
+            }
+            if (fine.zmin < zmin) {
+                zmin = fine.zmin;
+            }
+            if (fine.zmax > zmax) {
+                zmax = fine.zmax;
+            }
+            count += fine.count;
+            ring_mask |= fine.ring_mask;
+            idx.insert(idx.end(), fine.idx.begin(), fine.idx.end());
+        }
+
+        const int nx = std::max(1, max_ix - min_ix + 1);
+        const int ny = std::max(1, max_iy - min_iy + 1);
+        const int nz = std::max(1, max_iz - min_iz + 1);
+        const double cell_sx_d = base_x_ * static_cast<double>(nx);
+        const double cell_sy_d = base_y_ * static_cast<double>(ny);
+        const double cell_sz_d = base_z_ * static_cast<double>(nz);
+        const float cell_sx = static_cast<float>(std::max(cell_sx_d, base_x_));
+        const float cell_sy = static_cast<float>(std::max(cell_sy_d, base_y_));
+        const float cell_sz = static_cast<float>(std::max(cell_sz_d, base_z_));
+        const double cube_cx =
+            static_cast<double>(min_ix) * base_x_ + 0.5 * cell_sx_d;
+        const double cube_cy =
+            static_cast<double>(min_iy) * base_y_ + 0.5 * cell_sy_d;
+        const float cell_r = static_cast<float>(std::hypot(cube_cx, cube_cy));
+        const VoxelScale s = computeVoxelScale(static_cast<double>(cell_r));
+
+        Voxel v;
+        v.ix = min_ix;
+        v.iy = min_iy;
+        v.iz = min_iz;
+        v.count = count;
+        v.zmin = zmin;
+        v.zmax = zmax;
+        v.r = cell_r;
+        v.cx = static_cast<float>(cube_cx);
+        v.cy = static_cast<float>(cube_cy);
+        v.cell_sx = cell_sx;
+        v.cell_sy = cell_sy;
+        v.cell_sz = cell_sz;
+        v.merge_nx = nx;
+        v.merge_ny = ny;
+        v.merge_nz = nz;
+        v.ring_mask = ring_mask;
+        v.idx = std::move(idx);
+        v.cluster_id = cluster_n;
+        v.thr_z = static_cast<float>(s.thr_z);
+        v.size_xy = static_cast<float>(s.size_xy);
+        v.size_z = static_cast<float>(s.size_z);
+        grid_.emplace(static_cast<int64_t>(cluster_n), std::move(v));
+    }
 }
 
 int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
@@ -1222,18 +1133,6 @@ int64_t CloudPassthroughFilterNode::makeKey(int ix, int iy, int iz) const
     const int64_t uy = static_cast<int64_t>(iy) + kOffset;
     const int64_t uz = static_cast<int64_t>(iz) + kOffset;
     return (ux << 40) | (uy << 20) | uz;
-}
-
-int64_t CloudPassthroughFilterNode::makeCoarseKey(
-    int ox, int oy, int oz, int nxy, int nz) const
-{
-    constexpr int64_t kOff = 1 << 15;
-    const int64_t ux = static_cast<int64_t>(ox) + kOff;
-    const int64_t uy = static_cast<int64_t>(oy) + kOff;
-    const int64_t uz = static_cast<int64_t>(oz) + kOff;
-    const int64_t nx = static_cast<int64_t>(std::max(1, std::min(nxy, 255)));
-    const int64_t nzv = static_cast<int64_t>(std::max(1, std::min(nz, 255)));
-    return (ux << 48) | (uy << 32) | (uz << 16) | (nx << 8) | nzv;
 }
 
 int CloudPassthroughFilterNode::ringId(float x, float y, float z) const
@@ -1262,92 +1161,6 @@ void CloudPassthroughFilterNode::addRing(Voxel& v, uint32_t i, float x, float y,
     }
 }
 
-void CloudPassthroughFilterNode::assignClusters(std::vector<Voxel*>& all)
-{
-    const size_t n = all.size();
-    for (Voxel* v : all) {
-        if (v) {
-            v->cluster_id = 0;
-        }
-    }
-    if (n == 0) {
-        return;
-    }
-
-    std::vector<int> parent(static_cast<int>(n));
-    for (size_t i = 0; i < n; ++i) {
-        parent[i] = static_cast<int>(i);
-    }
-    auto find = [&](int x) {
-        while (parent[static_cast<size_t>(x)] != x) {
-            parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
-            x = parent[static_cast<size_t>(x)];
-        }
-        return x;
-    };
-    auto unite = [&](int a, int b) {
-        a = find(a);
-        b = find(b);
-        if (a != b) {
-            parent[static_cast<size_t>(b)] = a;
-        }
-    };
-
-    const float k3d = static_cast<float>(cluster_link_k_);
-    const float kxy = static_cast<float>(cluster_plane_k_);
-    const float link_min = static_cast<float>(cluster_link_m_);
-    const float ang = static_cast<float>(ang_v_);
-    for (size_t i = 0; i < n; ++i) {
-        const Voxel* a = all[i];
-        const float za = 0.5f * (a->zmin + a->zmax);
-        for (size_t j = i + 1; j < n; ++j) {
-            const Voxel* b = all[j];
-            const float dx = a->cx - b->cx;
-            const float dy = a->cy - b->cy;
-            const float zb = 0.5f * (b->zmin + b->zmax);
-            const float dz = za - zb;
-            const float rr = std::max(std::max(a->r, b->r), 1e-3f);
-            const float gap = rr * ang;
-            const float link3d = std::max(link_min, k3d * gap);
-            const float dxy2 = dx * dx + dy * dy;
-            const float d3 = dxy2 + dz * dz;
-            bool join = (d3 <= link3d * link3d);
-            if (!join) {
-                const float z_band = std::max(0.04f, 2.0f * gap);
-                const float link_xy = std::max(link3d, kxy * gap);
-                if (std::fabs(dz) <= z_band && dxy2 <= link_xy * link_xy) {
-                    join = true;
-                }
-            }
-            if (join) {
-                unite(static_cast<int>(i), static_cast<int>(j));
-            }
-        }
-    }
-
-    std::vector<int> root_size(n, 0);
-    for (size_t i = 0; i < n; ++i) {
-        ++root_size[static_cast<size_t>(find(static_cast<int>(i)))];
-    }
-
-    // 至少两格才编号，给后面整团扫用
-    std::vector<int> root_to_id(n, 0);
-    int next_id = 1;
-    for (size_t i = 0; i < n; ++i) {
-        if (find(static_cast<int>(i)) != static_cast<int>(i)) {
-            continue;
-        }
-        if (root_size[i] >= 2) {
-            root_to_id[i] = next_id++;
-        }
-    }
-    for (size_t i = 0; i < n; ++i) {
-        all[i]->cluster_id = root_to_id[static_cast<size_t>(find(static_cast<int>(i)))];
-    }
-    PT_INFO("连通团: 编号团 %d (link=%.2f k3d=%.1f k_xy=%.1f)，仅编号/可视化",
-            next_id - 1, cluster_link_m_, cluster_link_k_, cluster_plane_k_);
-}
-
 std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
 {
     std::vector<Voxel*> all;
@@ -1355,7 +1168,6 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
     for (auto& entry : grid_) {
         all.push_back(&entry.second);
     }
-    assignClusters(all);
 
     std::vector<Voxel*> bad;
     bad.reserve(grid_.size());
@@ -1380,7 +1192,7 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
         }
     }
 
-    PT_INFO("坏体素判定: 总格 %zu, 厚留 %zu, 坏 %zu ",
+    PT_INFO("坏体素判定: 大格 %zu, 厚留 %zu, 坏 %zu ",
             grid_.size(), thick_n, bad.size());
     if (have_sample) {
         PT_INFO("坏体素样例: span=%.4f < thr_z=%.4f", sample_span, sample_thr);
@@ -1388,13 +1200,13 @@ std::vector<Voxel*> CloudPassthroughFilterNode::collectBadVoxels()
     return bad;
 }
 
-void CloudPassthroughFilterNode::removePointsInBadVoxels(
-    pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+void CloudPassthroughFilterNode::markDropFromBadVoxels(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
     const std::vector<Voxel*>& bad_voxels,
-    const std_msgs::msg::Header& header)
+    std::vector<char>& drop)
 {
-    if (!cloud) {
-        PT_WARN("删点: 点云为空, 跳过");
+    if (!cloud || drop.size() != cloud->points.size()) {
+        PT_WARN("删点: drop 与点云长度不符, 跳过坏格标记");
         return;
     }
     if (bad_voxels.empty()) {
@@ -1403,7 +1215,6 @@ void CloudPassthroughFilterNode::removePointsInBadVoxels(
     }
 
     const uint32_t n = static_cast<uint32_t>(cloud->points.size());
-    std::vector<char> drop(n, 0);
     for (const Voxel* v : bad_voxels) {
         if (!v) {
             continue;
@@ -1423,7 +1234,152 @@ void CloudPassthroughFilterNode::removePointsInBadVoxels(
             }
         }
     }
+}
+
+void CloudPassthroughFilterNode::removePointsInBadVoxels(
+    pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    const std::vector<Voxel*>& bad_voxels,
+    const std_msgs::msg::Header& header)
+{
+    if (!cloud) {
+        PT_WARN("删点: 点云为空, 跳过");
+        return;
+    }
+    std::vector<char> drop(cloud->points.size(), 0);
+    markDropFromBadVoxels(cloud, bad_voxels, drop);
     removePointsByMask(cloud, drop, header);
+}
+
+void CloudPassthroughFilterNode::markSmallPointClusters(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    std::vector<char>& drop)
+{
+    if (!cloud || cloud->empty()) {
+        return;
+    }
+    const uint32_t n = static_cast<uint32_t>(cloud->points.size());
+    if (drop.size() != static_cast<size_t>(n)) {
+        PT_WARN("小团清扫: drop 长度与点数不符 (%zu vs %u), 跳过", drop.size(), n);
+        return;
+    }
+    if (small_cluster_max_points_ < 1) {
+        return;
+    }
+
+    const double link = std::max(small_cluster_link_m_, 1e-4);
+    const double link2 = link * link;
+    const double inv = 1.0 / link;
+
+    std::vector<uint32_t> ids;
+    ids.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (drop[i] != 0) {
+            continue;
+        }
+        const auto& p = cloud->points[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        if (!inOurCube(p.x, p.y, p.z)) {
+            continue;
+        }
+        ids.push_back(i);
+    }
+    if (ids.empty()) {
+        PT_INFO("小团清扫: 框内无候选点");
+        return;
+    }
+
+    const int m = static_cast<int>(ids.size());
+    std::vector<int> parent(static_cast<size_t>(m));
+    std::vector<int> rank(static_cast<size_t>(m), 0);
+    std::vector<int> sz(static_cast<size_t>(m), 1);
+    for (int i = 0; i < m; ++i) {
+        parent[static_cast<size_t>(i)] = i;
+    }
+    auto find = [&](int x) {
+        while (parent[static_cast<size_t>(x)] != x) {
+            parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+            x = parent[static_cast<size_t>(x)];
+        }
+        return x;
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) {
+            return;
+        }
+        if (rank[static_cast<size_t>(a)] < rank[static_cast<size_t>(b)]) {
+            std::swap(a, b);
+        }
+        parent[static_cast<size_t>(b)] = a;
+        sz[static_cast<size_t>(a)] += sz[static_cast<size_t>(b)];
+        if (rank[static_cast<size_t>(a)] == rank[static_cast<size_t>(b)]) {
+            ++rank[static_cast<size_t>(a)];
+        }
+    };
+
+    std::vector<int> cx(static_cast<size_t>(m));
+    std::vector<int> cy(static_cast<size_t>(m));
+    std::vector<int> cz(static_cast<size_t>(m));
+    std::unordered_map<int64_t, std::vector<int>> buckets;
+    buckets.reserve(static_cast<size_t>(m) * 2 + 1);
+    for (int k = 0; k < m; ++k) {
+        const auto& p = cloud->points[ids[static_cast<size_t>(k)]];
+        cx[static_cast<size_t>(k)] = static_cast<int>(std::floor(static_cast<double>(p.x) * inv));
+        cy[static_cast<size_t>(k)] = static_cast<int>(std::floor(static_cast<double>(p.y) * inv));
+        cz[static_cast<size_t>(k)] = static_cast<int>(std::floor(static_cast<double>(p.z) * inv));
+        buckets[makeKey(cx[static_cast<size_t>(k)], cy[static_cast<size_t>(k)], cz[static_cast<size_t>(k)])]
+            .push_back(k);
+    }
+
+    for (int k = 0; k < m; ++k) {
+        const auto& p = cloud->points[ids[static_cast<size_t>(k)]];
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const auto it = buckets.find(makeKey(
+                        cx[static_cast<size_t>(k)] + dx,
+                        cy[static_cast<size_t>(k)] + dy,
+                        cz[static_cast<size_t>(k)] + dz));
+                    if (it == buckets.end()) {
+                        continue;
+                    }
+                    for (int j : it->second) {
+                        if (j <= k) {
+                            continue;
+                        }
+                        const auto& q = cloud->points[ids[static_cast<size_t>(j)]];
+                        const double ddx = static_cast<double>(p.x) - static_cast<double>(q.x);
+                        const double ddy = static_cast<double>(p.y) - static_cast<double>(q.y);
+                        const double ddz = static_cast<double>(p.z) - static_cast<double>(q.z);
+                        if (ddx * ddx + ddy * ddy + ddz * ddz <= link2) {
+                            unite(k, j);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    size_t n_small_clusters = 0;
+    size_t n_drop_pts = 0;
+    std::vector<char> counted(static_cast<size_t>(m), 0);
+    for (int k = 0; k < m; ++k) {
+        const int root = find(k);
+        if (sz[static_cast<size_t>(root)] > small_cluster_max_points_) {
+            continue;
+        }
+        drop[ids[static_cast<size_t>(k)]] = 1;
+        ++n_drop_pts;
+        if (counted[static_cast<size_t>(root)] == 0) {
+            counted[static_cast<size_t>(root)] = 1;
+            ++n_small_clusters;
+        }
+    }
+    PT_INFO("小团清扫: 框内候选 %d, 小团 %zu, 删 %zu 点 (团点数≤%d, link=%.3f)",
+            m, n_small_clusters, n_drop_pts, small_cluster_max_points_, link);
 }
 
 void CloudPassthroughFilterNode::removePointsByMask(
@@ -1533,8 +1489,7 @@ void CloudPassthroughFilterNode::publishFilterDebug(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& pass_cloud,
     const std::vector<Voxel*>& bad_voxels,
     const std_msgs::msg::Header& header,
-    const std::vector<char>* drop_mask,
-    const std::vector<char>* restored_mask)
+    const std::vector<char>* drop_mask)
 {
     std::unordered_set<const Voxel*> bad_set;
     bad_set.reserve(bad_voxels.size() * 2 + 1);
@@ -1585,41 +1540,9 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         }
     }
 
-    std::unordered_set<uint64_t> restored_keys;
-    restored_keys.reserve(256);
-    if (n_pass > 0 && restored_mask != nullptr &&
-        restored_mask->size() == static_cast<size_t>(n_pass)) {
-        for (uint32_t i = 0; i < n_pass; ++i) {
-            if ((*restored_mask)[i] == 0) {
-                continue;
-            }
-            const auto& p = pass_cloud->points[i];
-            restored_keys.insert(pack_key(p.x, p.y, p.z));
-        }
-    } else if (n_pass > 0) {
-        // 无逐点 mask 时：捞回格里、最终未删的点算青
-        for (const auto& entry : grid_) {
-            const Voxel& v = entry.second;
-            if (!v.restored) {
-                continue;
-            }
-            for (uint32_t idx : v.idx) {
-                if (idx >= n_pass) {
-                    continue;
-                }
-                const auto& p = pass_cloud->points[idx];
-                const uint64_t key = pack_key(p.x, p.y, p.z);
-                if (deleted_keys.count(key) == 0) {
-                    restored_keys.insert(key);
-                }
-            }
-        }
-    }
-
-    // 1) 红=删，青=大格捞回，绿=其它留下，蓝=立方体内但没进直通
+    // 1) 红=删，绿=留下，蓝=立方体内但没进直通
     size_t n_del = 0;
     size_t n_keep = 0;
-    size_t n_rest = 0;
     size_t n_blue = 0;
     if (verdict_publisher_ && raw_cloud && !raw_cloud->empty()) {
         const uint32_t n_raw = static_cast<uint32_t>(raw_cloud->points.size());
@@ -1629,7 +1552,6 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         color.reserve(n_raw);
         const uint32_t c_del = packRgb(240, 40, 40);
         const uint32_t c_keep = packRgb(40, 220, 80);
-        const uint32_t c_rest = packRgb(40, 220, 220);  // 青=捞回
         const uint32_t c_blue = packRgb(40, 110, 255);
 
         for (uint32_t i = 0; i < n_raw; ++i) {
@@ -1646,10 +1568,6 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                     pick.push_back(i);
                     color.push_back(c_del);
                     ++n_del;
-                } else if (restored_keys.count(key) != 0) {
-                    pick.push_back(i);
-                    color.push_back(c_rest);
-                    ++n_rest;
                 } else {
                     pick.push_back(i);
                     color.push_back(c_keep);
@@ -1792,17 +1710,11 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             cube.scale.x = sx;
             cube.scale.y = sy;
             cube.scale.z = sz;
-            if (is_bad && !v.restored) {
+            if (is_bad) {
                 cube.color.r = 0.95f;
                 cube.color.g = 0.2f;
                 cube.color.b = 0.2f;
                 cube.color.a = 0.28f;
-            } else if (v.restored) {
-                // 青=小格本判删、大格捞回（对齐 plane-fit 保护色）
-                cube.color.r = 0.15f;
-                cube.color.g = 0.85f;
-                cube.color.b = 0.9f;
-                cube.color.a = 0.32f;
             } else {
                 cube.color.r = 0.2f;
                 cube.color.g = 0.85f;
@@ -1826,26 +1738,19 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             text.color.g = 1.0f;
             text.color.b = 0.85f;
             text.color.a = 1.0f;
-            char buf[144];
+            char buf[160];
             const float zspan = v.zmax - v.zmin;
-            const double xy_r = lookupSizeXyRatio(static_cast<double>(v.r));
-            const double z_r = lookupSizeZRatio(static_cast<double>(v.r));
-            if (v.restored && v.cluster_id > 0) {
+            const double cell_r = std::hypot(cx, cy);
+            const double line_gap = cell_r * ang_v_;
+            const double thr_ratio = lookupThrRatio(cell_r);
+            if (v.cluster_id > 0) {
                 std::snprintf(buf, sizeof(buf),
-                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,t%d,rest",
-                              xy_r, z_r, zspan, v.thr_z, v.cluster_id);
-            } else if (v.restored) {
-                std::snprintf(buf, sizeof(buf),
-                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,rest",
-                              xy_r, z_r, zspan, v.thr_z);
-            } else if (v.cluster_id > 0) {
-                std::snprintf(buf, sizeof(buf),
-                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f,t%d",
-                              xy_r, z_r, zspan, v.thr_z, v.cluster_id);
+                              "x:%.2f,y:%.2f,z:%.2f,span:%.2f,thr:%.2f,thr_z:%.2fx%.2f,t%d",
+                              cx, cy, cz, zspan, v.thr_z, line_gap, thr_ratio, v.cluster_id);
             } else {
                 std::snprintf(buf, sizeof(buf),
-                              "size_xy_bands:%.1f,size_z_bands:%.1f,span:%.2f,thr:%.2f",
-                              xy_r, z_r, zspan, v.thr_z);
+                              "x:%.2f,y:%.2f,z:%.2f,span:%.2f,thr:%.2f,thr_z:%.2fx%.2f",
+                              cx, cy, cz, zspan, v.thr_z, line_gap, thr_ratio);
             }
             text.text = buf;
             arr.markers.push_back(text);
@@ -1856,14 +1761,12 @@ void CloudPassthroughFilterNode::publishFilterDebug(
             if (v.count == 0 || v.idx.empty()) {
                 continue;
             }
-            // 画合并后的那一格：边长 = n×base，夹在 max_xy/max_z 内
-            const double sx = std::min(
-                std::max(static_cast<double>(v.cell_sx), base_xy_), max_xy_);
-            const double sy = sx;
-            const double sz = std::min(
-                std::max(static_cast<double>(v.cell_sz), base_z_), max_z_);
-            const double cx = static_cast<double>(v.ix) * base_xy_ + 0.5 * sx;
-            const double cy = static_cast<double>(v.iy) * base_xy_ + 0.5 * sy;
+            // 画邻接表并成的大格，x/y 按实际跨度，不再撑成正方形
+            const double sx = std::max(static_cast<double>(v.cell_sx), base_x_);
+            const double sy = std::max(static_cast<double>(v.cell_sy), base_y_);
+            const double sz = std::max(static_cast<double>(v.cell_sz), base_z_);
+            const double cx = static_cast<double>(v.ix) * base_x_ + 0.5 * sx;
+            const double cy = static_cast<double>(v.iy) * base_y_ + 0.5 * sy;
             const double cz = static_cast<double>(v.iz) * base_z_ + 0.5 * sz;
             const double z_top = cz + 0.5 * sz;
             const bool is_bad = bad_set.count(&v) != 0;
@@ -1872,13 +1775,13 @@ void CloudPassthroughFilterNode::publishFilterDebug(
                 append_voxel(arr_all, "occupied_voxels", is_bad,
                              cx, cy, cz, sx, sy, sz, z_top, v);
             }
-            // 仍删且未捞回 → 红；捞回格进留侧（青）
-            if (is_bad && !v.restored && voxels_deleted_publisher_) {
+            // 坏格进删话题，其余进留话题
+            if (is_bad && voxels_deleted_publisher_) {
                 append_voxel(arr_del, "deleted_voxels", true,
                              cx, cy, cz, sx, sy, sz, z_top, v);
                 ++drawn_del;
             }
-            if ((!is_bad || v.restored) && voxels_kept_publisher_) {
+            if (!is_bad && voxels_kept_publisher_) {
                 append_voxel(arr_keep, "kept_voxels", false,
                              cx, cy, cz, sx, sy, sz, z_top, v);
                 ++drawn_keep;
@@ -1895,9 +1798,9 @@ void CloudPassthroughFilterNode::publishFilterDebug(
         if (voxels_kept_publisher_) {
             voxels_kept_publisher_->publish(arr_keep);
         }
-        PT_INFO("调试可视化: 红删 %zu 青绿捞回 %zu 绿留 %zu 蓝(立方体无直通) %zu "
+        PT_INFO("调试可视化: 红删 %zu 绿留 %zu 蓝立方体无直通 %zu "
                 "体素合并 %zu 删格话题 %zu 留格话题 %zu / 总格 %zu",
-                n_del, n_rest, n_keep, n_blue, drawn, drawn_del, drawn_keep, grid_.size());
+                n_del, n_keep, n_blue, drawn, drawn_del, drawn_keep, grid_.size());
      }
 }
 
