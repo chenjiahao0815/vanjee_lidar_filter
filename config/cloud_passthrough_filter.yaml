@@ -47,17 +47,17 @@ cloud_passthrough_filter_node:
     ang_h: 0.0034906585
     ang_v: 0.0174532925
     r_max: 8.0
-    base_x: 0.05
-    base_y: 0.05
-    base_z: 0.05
 
+    base_x: 0.1
+    base_y: 0.1
+    base_z: 0.1
 
-    thr_ratio: "(0.0,3),(1.0,6)"  # 越大删得越多  thr_z = line_gap x thr_ratio
-    thr_z_min: 0.15
+    thr_ratio: "(0.0,3),(1.0,3)"  # 越大删得越多  thr_z = line_gap x thr_ratio
+    thr_z_min: 0.16
 
     # 体素删完后，框内留下的点再聚一次；整团点数不超过门槛当残渣删
     enable_small_cluster_filter: true
-    small_cluster_max_points: 10
+    small_cluster_max_points: 20
     small_cluster_link_m: 0.15  # 点距小于这个才算同一团
 
     # 红=体素删掉 绿=留下 蓝=进了立方体但没进直通

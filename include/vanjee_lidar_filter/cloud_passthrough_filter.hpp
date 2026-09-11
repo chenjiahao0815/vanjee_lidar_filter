@@ -135,7 +135,7 @@ private:
     void buildVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void flattenOccupiedVoxels();
     void buildNeighborTable();
-    // 用邻接表并成大格，斜墙被切开的细格连回去再判厚度
+    // 邻接表并大格；边两端各自在同一xy柱上还有其他z格才并
     void mergeFineVoxels();
     // 接收有点的体素列表，返回需要删除的体素；真正删点另写
     std::vector<Voxel*> collectBadVoxels();
