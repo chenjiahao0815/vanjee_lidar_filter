@@ -53,9 +53,9 @@ cloud_passthrough_filter_node:
     base_z: 0.05
 
     thr_ratio: "(0.0,4),(1.0,3)"  # 越大删得越多  thr_z = line_gap x thr_ratio
-    thr_z_min: 0.1
+    thr_z_min: 0.15
 
-    enable_merge_z_check: false
+    enable_merge_z_check: true
 
     # 体素删完后，框内留下的点再聚一次；整团点数不超过门槛当残渣删
     enable_small_cluster_filter: true
