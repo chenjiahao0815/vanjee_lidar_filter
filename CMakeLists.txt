@@ -50,8 +50,6 @@ install(TARGETS
 install(DIRECTORY
   config
   launch
-  scripts
-  rviz
   DESTINATION share/${PROJECT_NAME}
   USE_SOURCE_PERMISSIONS
 )

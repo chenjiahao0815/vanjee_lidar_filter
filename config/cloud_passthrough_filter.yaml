@@ -2,22 +2,15 @@ cloud_passthrough_filter_node:
   ros__parameters:
     use_sim_time: true
 
-    input_topic: "/vanjee/lidar"
+    # input_topic: "/vanjee/lidar"
+    input_topic: "/livox/lidar" 
     output_topic: "/vanjee/lidar_passthrough"
-
     filter_order: "xyz"
     enable_x: true
     enable_y: true
     enable_z: true
 
-    # 原先按 front_ground_segmentation 的前方直通，和雷达中心立方体对不齐
-    # limit_min_x: 0.0
-    # limit_max_x: 3.5
-    # limit_min_y: -2.0
-    # limit_max_y: 2.0
-    # limit_min_z: -0.2
-    # limit_max_z: 0.4
-    # 与立方体 4×4×2（|x|≤2, |y|≤2, |z|≤1）对齐
+    # 原先 front_ground_segmentation 的前方直通
     limit_min_x: -8.0
     limit_max_x: 8.0
     limit_min_y: -8.0
@@ -25,16 +18,16 @@ cloud_passthrough_filter_node:
     limit_min_z: -2.0
     limit_max_z: 2.0
 
-    debug_mode: true
+    debug_mode: false   # 是否开启可视化  
     debug_topic_x: "/vanjee/passthrough_x"
     debug_topic_y: "/vanjee/passthrough_y"
     debug_topic_z: "/vanjee/passthrough_z"
 
     memory_pool_size: 10
     memory_pool_reserve: 1000000
-    cloud_log_interval_sec: 1.0
+    cloud_log_interval_sec: 1.0     # 日志打印间隔时间
 
-    # 立方体
+    # 后处理裁剪时候的范围
     cube_min_x: -2.5
     cube_max_x: 2.5
     cube_min_y: -2.5
@@ -42,24 +35,25 @@ cloud_passthrough_filter_node:
     cube_min_z: -1.0
     cube_max_z: 1.0
 
-    removed_topic: "/vanjee/lidar_removed"
-    enable_voxel_filter: true
+    removed_topic: "/vanjee/lidar_removed"  # 可视化的时候被删掉的点发的话题
+    enable_voxel_filter: true    # 直通过后是否体素删点的开关
+    # 雷达的分辨率
     ang_h: 0.0034906585
     ang_v: 0.0174532925
-    r_max: 8.0
-
+    # 基础体素最小的值
     base_x: 0.05
     base_y: 0.05
     base_z: 0.05
 
-    thr_ratio: "(0.0,4),(1.0,3)"  # 越大删得越多  thr_z = line_gap x thr_ratio
-    thr_z_min: 0.15
+    thr_ratio: "(0.0,4),(1.0,3)"  # 越大删得越多    表示为大于前面数字的范围的，扩大后面数字的倍率   如（0.0，3） 就是大于0m的，扩大3倍 
+    thr_z_min: 0.15  # thr_z = line_gap x thr_ratio  最小0.15
 
-    enable_merge_z_check: true
+    enable_merge_z_check: true     # 是否开启以查找表合并的时候需要判断同z位置，是否有体素的判断
+                                  #用来删除贴近墙面的，比较水平的噪点
 
     # 体素删完后，框内留下的点再聚一次；整团点数不超过门槛当残渣删
-    enable_small_cluster_filter: true
-    small_cluster_max_points: 30
+    enable_small_cluster_filter: true   #开启这个功能
+    small_cluster_max_points: 30   # 聚类以后，小于这个参数的点，就删了
     small_cluster_link_m: 0.15  # 点距小于这个才算同一团
 
     # 红=体素删掉 绿=留下 蓝=进了立方体但没进直通
@@ -68,4 +62,3 @@ cloud_passthrough_filter_node:
     voxels_topic: "/vanjee/voxel_markers"
     voxels_deleted_topic: "/vanjee/voxel_markers_deleted"
     voxels_kept_topic: "/vanjee/voxel_markers_kept"
-    publish_occupied_voxels: true

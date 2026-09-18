@@ -450,9 +450,13 @@ bool CloudPassthroughFilterNode::loadRingField(const sensor_msgs::msg::PointClou
         ring_of_cur_.clear();
         have_ring_ = false;
 
+        // s1 万集用 ring；g3 Livox用 line
+        const char* want_name =
+            (input_topic_ == "/livox/lidar") ? "line" : "ring";
+
         const sensor_msgs::msg::PointField* ring_field = nullptr;
         for (const auto& f : msg.fields) {
-            if (f.name == "ring") {
+            if (f.name == want_name) {
                 ring_field = &f;
                 break;
             }
