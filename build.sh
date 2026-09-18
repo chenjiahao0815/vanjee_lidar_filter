@@ -13,7 +13,8 @@ if [[ -z "${ROS_DISTRO:-}" ]]; then
 fi
 
 echo "[build.sh] 开始编译: $_VLF_ROOT"
-colcon build --packages-select vanjee_lidar_filter --symlink-install
+colcon build --packages-select vanjee_lidar_filter --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 _VLF_RC=$?
 
 if [[ $_VLF_RC -ne 0 ]]; then

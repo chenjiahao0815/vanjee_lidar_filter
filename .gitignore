@@ -8,3 +8,8 @@ log/
 .idea/
 __pycache__/
 *.pyc
+
+# 本地备份 / 可视化 / 数据包，不入库
+copy/
+rviz/
+scripts/
