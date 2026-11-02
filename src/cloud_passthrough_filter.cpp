@@ -168,6 +168,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     this->declare_parameter("enable_small_cluster_filter", true);
     this->declare_parameter("small_cluster_max_points", 10);
     this->declare_parameter("small_cluster_link_m", 0.15);
+    this->declare_parameter("rear_sliver_y", -2.5);
+    this->declare_parameter("rear_sliver_width", 0.32);
+    this->declare_parameter("rear_sliver_aspect", 5.0);
     this->declare_parameter("verdict_topic", std::string("/vanjee/filter_verdict"));
     this->declare_parameter("boxes_topic", std::string("/vanjee/filter_boxes"));
     this->declare_parameter("voxels_topic", std::string("/vanjee/voxel_markers"));
@@ -240,6 +243,9 @@ void CloudPassthroughFilterNode::declare_and_load_parameters()
     if (small_cluster_link_m_ <= 0.0) {
         small_cluster_link_m_ = 0.15;
     }
+    rear_sliver_y_ = this->get_parameter("rear_sliver_y").as_double();
+    rear_sliver_width_ = this->get_parameter("rear_sliver_width").as_double();
+    rear_sliver_aspect_ = this->get_parameter("rear_sliver_aspect").as_double();
     verdict_topic_ = this->get_parameter("verdict_topic").as_string();
     boxes_topic_ = this->get_parameter("boxes_topic").as_string();
     voxels_topic_ = this->get_parameter("voxels_topic").as_string();
@@ -1348,15 +1354,6 @@ void CloudPassthroughFilterNode::markDropFromBadVoxels(
         if (!v) {
             continue;
         }
-        const float zmid = 0.5f * (v->zmin + v->zmax);
-        const float zspan = v->zmax - v->zmin;
-        if (v->cluster_id > 0) {
-            PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f t%d",
-                    v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z, v->cluster_id);
-        } else {
-            PT_INFO("删体素: #%d xyz=(%.2f,%.2f,%.2f) zspan=%.3f thr_z=%.3f",
-                    v->cell_id, v->cx, v->cy, zmid, zspan, v->thr_z);
-        }
         for (uint32_t idx : v->idx) {
             if (idx < n) {
                 drop[idx] = 1;
@@ -1536,6 +1533,69 @@ void CloudPassthroughFilterNode::markSmallPointClusters(
         drop[ids[static_cast<size_t>(k)]] = 1;
     }
 
+    if (rear_sliver_width_ > 0.0) {
+        struct Acc {
+            double sx{0.0};
+            double sy{0.0};
+            double sxx{0.0};
+            double syy{0.0};
+            double sxy{0.0};
+            int n{0};
+        };
+        std::unordered_map<int, Acc> acc;
+        acc.reserve(static_cast<size_t>(m) / 4 + 1);
+        for (int k = 0; k < m; ++k) {
+            if (drop[ids[static_cast<size_t>(k)]] != 0) {
+                continue;
+            }
+            const double y = static_cast<double>(py[static_cast<size_t>(k)]);
+            if (y >= rear_sliver_y_) {
+                continue;
+            }
+            Acc& a = acc[find(k)];
+            const double x = static_cast<double>(px[static_cast<size_t>(k)]);
+            a.sx += x;
+            a.sy += y;
+            a.sxx += x * x;
+            a.syy += y * y;
+            a.sxy += x * y;
+            ++a.n;
+        }
+        std::unordered_set<int> slim;
+        for (const auto& kv : acc) {
+            const Acc& a = kv.second;
+            if (a.n < 3) {
+                continue;
+            }
+            const double inv = 1.0 / static_cast<double>(a.n);
+            const double mx = a.sx * inv;
+            const double my = a.sy * inv;
+            const double cxx = a.sxx * inv - mx * mx;
+            const double cyy = a.syy * inv - my * my;
+            const double cxy = a.sxy * inv - mx * my;
+            const double tr = cxx + cyy;
+            const double det = cxx * cyy - cxy * cxy;
+            const double disc = std::max(0.0, tr * tr * 0.25 - det);
+            const double half = std::sqrt(disc);
+            const double lmin = std::max(0.0, tr * 0.5 - half);
+            const double lmax = std::max(0.0, tr * 0.5 + half);
+            const double width = std::sqrt(lmin * 12.0);
+            const double length = std::sqrt(lmax * 12.0);
+            const double aspect = width > 1e-6 ? length / width : 0.0;
+            if (width < rear_sliver_width_ && aspect >= rear_sliver_aspect_) {
+                slim.insert(kv.first);
+            }
+        }
+        for (int k = 0; k < m; ++k) {
+            if (py[static_cast<size_t>(k)] >= rear_sliver_y_) {
+                continue;
+            }
+            if (slim.count(find(k)) != 0) {
+                drop[ids[static_cast<size_t>(k)]] = 1;
+            }
+        }
+    }
+
     if (!shouldFrameLog()) {
         return;
     }
@@ -1596,15 +1656,6 @@ void CloudPassthroughFilterNode::markSmallPointClusters(
                   }
                   return a.id < b.id;
               });
-    for (const ClusterLog& c : clusters) {
-        if (c.drop) {
-            PT_INFO("小团清扫: 团#%d 删 点数=%d 中心=(%.2f,%.2f,%.2f) (≤%d)",
-                    c.id, c.npts, c.cx, c.cy, c.cz, small_cluster_max_points_);
-        } else {
-            PT_INFO("小团清扫: 团#%d 留 点数=%d 中心=(%.2f,%.2f,%.2f) (>%d)",
-                    c.id, c.npts, c.cx, c.cy, c.cz, small_cluster_max_points_);
-        }
-    }
     PT_INFO("小团清扫: 框内候选 %d, 团总数 %zu (留 %zu / 删 %zu), 删 %zu 点 (团点数≤%d, link=%.3f)",
             m, clusters.size(), n_keep_clusters, n_small_clusters, n_drop_pts,
             small_cluster_max_points_, static_cast<double>(link));

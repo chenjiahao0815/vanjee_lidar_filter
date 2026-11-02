@@ -1,8 +1,8 @@
 cloud_passthrough_filter_node:
   ros__parameters:
     use_sim_time: true
-
-    input_topic: "/vanjee/lidar"
+    # input_topic: "/vanjee/lidar"
+    input_topic: "/ground_map_filter/non_ground"
     output_topic: "/vanjee/lidar_passthrough"
     filter_order: "xyz"
     enable_x: true
@@ -10,10 +10,10 @@ cloud_passthrough_filter_node:
     enable_z: true
 
     # 原先 front_ground_segmentation 的前方直通
-    limit_min_x: -8.0
-    limit_max_x: 8.0
-    limit_min_y: -8.0
-    limit_max_y: 8.0
+    limit_min_x: -10.0
+    limit_max_x: 10.0
+    limit_min_y: -50.0
+    limit_max_y: 50.0
     limit_min_z: -2.0
     limit_max_z: 2.0
 
@@ -52,8 +52,10 @@ cloud_passthrough_filter_node:
 
     # 体素删完后，框内留下的点再聚一次；整团点数不超过门槛当残渣删
     enable_small_cluster_filter: true   #开启这个功能
-    small_cluster_max_points: 30   # 聚类以后，小于这个参数的点，就删了
-    small_cluster_link_m: 0.15  # 点距小于这个才算同一团
+    # small_cluster_max_points: 30   # 聚类以后，小于这个参数的点，就删了
+    # small_cluster_link_m: 0.15  # 点距小于这个才算同一团
+    small_cluster_max_points: 8   # 聚类以后，小于这个参数的点，就删了
+    small_cluster_link_m: 0.75  # 点距小于这个才算同一团
 
     # 红=体素删掉 绿=留下 蓝=进了立方体但没进直通
     verdict_topic: "/vanjee/filter_verdict"

@@ -224,6 +224,9 @@ private:
     bool enable_small_cluster_filter_{true};
     int small_cluster_max_points_{10};
     double small_cluster_link_m_{0.15};
+    double rear_sliver_y_{-2.5};
+    double rear_sliver_width_{0.32};
+    double rear_sliver_aspect_{5.0};
 
     std::unordered_map<int64_t, Voxel> grid_;
     std::unordered_map<int64_t, Voxel> fine_grid_;
